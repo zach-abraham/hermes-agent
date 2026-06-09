@@ -1924,80 +1924,73 @@ install_node_deps() {
     restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
-# Provision the native OpenTUI engine (Bun runtime + `bun install` in
-# ui-tui-opentui-v2). The launcher (hermes_cli/main.py:_opentui_available)
-# defaults the TUI to OpenTUI only when Bun resolves AND the v2 package's
-# node_modules/@opentui is present, otherwise it transparently falls back to
-# the legacy Ink engine. So this stage is STRICTLY best-effort: any failure
-# (unsupported platform, no network, Bun install fails, `bun install` fails)
-# logs a warning and returns 0. A skipped OpenTUI setup just means the user
-# gets Ink — breaking the install would be far worse than skipping OpenTUI.
-# Every sub-step is guarded with `|| { log_warn ...; return 0; }`; this
-# function never `exit`s and never returns non-zero.
+# Provision the native OpenTUI engine on NODE 26.3+ (no Bun): `npm install` +
+# `npm run build` (esbuild → dist/main.js) in ui-opentui. The engine's
+# renderer loads via the experimental `node:ffi` API that only exists on Node
+# 26.3+. The launcher (hermes_cli/main.py:_opentui_available) only uses OpenTUI
+# when a Node >= 26.3 resolves AND the v2 package is built; otherwise it falls
+# back to the Ink engine. So this stage is STRICTLY best-effort: any failure
+# (unsupported platform, Node < 26.3, no network, install/build fails) logs a
+# warning and returns 0. A skipped OpenTUI setup just means the user gets Ink —
+# breaking the install would be far worse than skipping OpenTUI. Every sub-step
+# is guarded; this function never `exit`s and never returns non-zero.
 install_opentui() {
-    # Bun is unreliable on Windows and Termux — keep those hosts on Ink.
-    # (detect_os already aborts the bash installer on Windows, but guard
-    # defensively in case this is ever reached via a stage runner.)
+    # node:ffi isn't validated on Windows/Termux — keep those hosts on Ink.
     if [ "$OS" = "windows" ] || [ "$DISTRO" = "termux" ] || [ "$OS" = "android" ]; then
         log_info "Skipping OpenTUI engine (unsupported platform) — using Ink."
         return 0
     fi
 
     # Only meaningful if the v2 package is present in this checkout.
-    if [ ! -f "$INSTALL_DIR/ui-tui-opentui-v2/package.json" ]; then
-        log_info "Skipping OpenTUI engine (ui-tui-opentui-v2 not present) — using Ink."
+    if [ ! -f "$INSTALL_DIR/ui-opentui/package.json" ]; then
+        log_info "Skipping OpenTUI engine (ui-opentui not present) — using Ink."
         return 0
     fi
 
-    log_info "Setting up OpenTUI engine (native TUI)..."
+    log_info "Setting up OpenTUI engine (native TUI, Node 26.3+ / node:ffi)..."
 
-    # Resolve Bun: PATH, then the common install dirs the launcher also probes
-    # (HERMES_BUN > bun on PATH > ~/.bun/bin/bun > /usr/local/bin > Homebrew).
-    local bun_bin=""
-    if command -v bun >/dev/null 2>&1; then
-        bun_bin="$(command -v bun)"
-    else
-        for cand in "$HOME/.bun/bin/bun" "/usr/local/bin/bun" "/opt/homebrew/bin/bun"; do
-            if [ -x "$cand" ]; then
-                bun_bin="$cand"
-                break
-            fi
-        done
-    fi
-
-    # Install Bun if it isn't already resolvable (idempotent: skipped when found).
-    if [ -z "$bun_bin" ]; then
-        log_info "Installing Bun (https://bun.sh)..."
-        # Best-effort: bun.sh's installer drops the binary at ~/.bun/bin/bun.
-        # On any failure (no network, install error) warn and fall back to Ink.
-        if ! curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1; then
-            log_warn "OpenTUI engine setup skipped (Bun install failed) — the Ink engine will be used; see https://bun.sh"
-            return 0
+    # Resolve a Node >= 26.3.0 (the node:ffi floor): HERMES_NODE > node on PATH,
+    # version-checked. We do NOT install Node here — if one new enough isn't
+    # available the launcher cleanly falls back to Ink.
+    local node_bin=""
+    for cand in "${HERMES_NODE:-}" "$(command -v node 2>/dev/null || true)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] || continue
+        if "$cand" -e 'const p=process.versions.node.split(".").map(Number); process.exit(p[0]>26||(p[0]===26&&p[1]>=3)?0:1)' 2>/dev/null; then
+            node_bin="$cand"
+            break
         fi
-        if command -v bun >/dev/null 2>&1; then
-            bun_bin="$(command -v bun)"
-        elif [ -x "$HOME/.bun/bin/bun" ]; then
-            bun_bin="$HOME/.bun/bin/bun"
-        fi
+    done
+    if [ -z "$node_bin" ]; then
+        log_warn "OpenTUI engine setup skipped (needs Node >= 26.3.0; none found) — using the Ink engine. Install Node 26.3+ or set HERMES_NODE."
+        return 0
     fi
+    log_success "Node found ($("$node_bin" --version 2>/dev/null || echo "unknown"))"
 
-    if [ -z "$bun_bin" ]; then
-        log_warn "OpenTUI engine setup skipped (Bun not available after install) — the Ink engine will be used; see https://bun.sh"
+    # npm ships with Node; the build (`node scripts/build.mjs`) runs fine on any
+    # recent Node — only the runtime needs 26.3, which the launcher re-checks.
+    local npm_bin
+    npm_bin="$(command -v npm 2>/dev/null || true)"
+    if [ -z "$npm_bin" ]; then
+        log_warn "OpenTUI engine setup skipped (npm not found) — using the Ink engine."
         return 0
     fi
 
-    log_success "Bun found ($("$bun_bin" --version 2>/dev/null || echo "unknown"))"
+    cd "$INSTALL_DIR/ui-opentui" || { log_warn "OpenTUI engine setup skipped (cd failed) — using Ink."; return 0; }
 
-    # Pull the v2 package's dependencies — this fetches the per-arch
-    # @opentui/core-<arch> native lib automatically. Idempotent.
-    log_info "Installing OpenTUI dependencies (bun install)..."
-    cd "$INSTALL_DIR/ui-tui-opentui-v2"
-    if ! "$bun_bin" install >/dev/null 2>&1; then
-        log_warn "OpenTUI engine setup skipped (bun install failed) — the Ink engine will be used; see https://bun.sh"
+    # Pull deps (fetches the per-arch @opentui/core-<arch> native lib) then build
+    # the Node bundle (dist/main.js). Both idempotent.
+    log_info "Installing OpenTUI dependencies (npm install)..."
+    if ! "$npm_bin" install --no-audit --no-fund >/dev/null 2>&1; then
+        log_warn "OpenTUI engine setup skipped (npm install failed) — the Ink engine will be used."
+        return 0
+    fi
+    log_info "Building OpenTUI engine (npm run build)..."
+    if ! "$npm_bin" run build >/dev/null 2>&1; then
+        log_warn "OpenTUI engine setup skipped (build failed) — the Ink engine will be used."
         return 0
     fi
 
-    log_success "OpenTUI engine ready (now the default; set HERMES_TUI_ENGINE=ink for the legacy Ink engine)."
+    log_success "OpenTUI engine ready (opt-in: HERMES_TUI_ENGINE=opentui; default is Ink)."
     return 0
 }
 
