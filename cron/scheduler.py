@@ -47,6 +47,54 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _native_tool_cron_allowlist_route(
+    job: dict,
+    provider_routing: dict,
+) -> dict | None:
+    """Return an explicit native-tool route for an allowlisted cron job.
+
+    This is deliberately narrower than generic provider routing: it only
+    affects unpinned agent-backed jobs whose id/name is present in the
+    disabled-by-default allowlist. Existing pinned provider/base_url jobs and
+    no_agent script jobs keep their current paths.
+    """
+    if not isinstance(provider_routing, dict):
+        return None
+    allow = provider_routing.get("native_tool_cron_allowlist")
+    if not isinstance(allow, dict) or not allow.get("enabled"):
+        return None
+    if job.get("no_agent"):
+        return None
+    if (job.get("provider") or job.get("base_url")):
+        return None
+
+    job_id = str(job.get("id") or "").strip()
+    job_name = str(job.get("name") or "").strip()
+    ids = {
+        str(item).strip()
+        for item in (allow.get("job_ids") or [])
+        if str(item).strip()
+    }
+    names = {
+        str(item).strip()
+        for item in (allow.get("job_names") or [])
+        if str(item).strip()
+    }
+    if job_id not in ids and job_name not in names:
+        return None
+
+    provider = str(allow.get("provider") or "").strip()
+    model = str(allow.get("model") or "").strip()
+    adapter = str(allow.get("adapter") or "").strip()
+    if not provider or not model or adapter != "ollama_native_chat":
+        return None
+    return {
+        "provider": provider,
+        "model": model,
+        "adapter": adapter,
+    }
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -2656,6 +2704,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
+        native_route = _native_tool_cron_allowlist_route(job, pr)
+        runtime_requested_provider = job.get("provider")
+        runtime_explicit_base_url = job.get("base_url")
+        if native_route:
+            runtime_requested_provider = native_route["provider"]
+            runtime_explicit_base_url = None
+            model = native_route["model"]
+            logger.info(
+                "Job '%s': native tool cron allowlist route selected: provider=%s model=%s adapter=%s",
+                job_id,
+                native_route["provider"],
+                native_route["model"],
+                native_route["adapter"],
+            )
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -2678,10 +2740,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": runtime_requested_provider,
             }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            if runtime_explicit_base_url:
+                runtime_kwargs["explicit_base_url"] = runtime_explicit_base_url
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
             # Primary provider auth failed — try fallback chain before giving up.
@@ -2727,14 +2789,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # before — the guard never engages for it. Pinned axes are unaffected.
         _drift: list[str] = []
         _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-        if _provider_snapshot and not (job.get("provider") or "").strip():
+        if _provider_snapshot and not native_route and not (job.get("provider") or "").strip():
             _current_provider = str(runtime.get("provider") or "").strip().lower()
             if _current_provider and _current_provider != _provider_snapshot:
                 _drift.append(
                     f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                 )
         _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-        if _model_snapshot and not (job.get("model") or "").strip():
+        if _model_snapshot and not native_route and not (job.get("model") or "").strip():
             _current_model = str(model or "").strip().lower()
             if _current_model and _current_model != _model_snapshot:
                 _drift.append(

@@ -63,6 +63,10 @@ def _discover_transports() -> None:
     except ImportError:
         pass
     try:
+        import agent.transports.ollama_native  # noqa: F401
+    except ImportError:
+        pass
+    try:
         import agent.transports.bedrock  # noqa: F401
     except ImportError:
         pass
