@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -32,6 +33,23 @@ for _name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2"):
     _val = getattr(signal, _name, None)
     if _val is not None:
         _SIGNAL_NAME_BY_NUM[int(_val)] = _name
+
+
+def _find_executable(name: str) -> Optional[str]:
+    """Resolve an executable even under launchd/cron's stripped PATH."""
+    search_path = os.pathsep.join(
+        part
+        for part in (
+            os.environ.get("PATH", ""),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            str(Path.home() / ".local" / "bin"),
+            "/usr/bin",
+            "/bin",
+        )
+        if part
+    )
+    return shutil.which(name, path=search_path)
 
 
 def _signal_name(sig: Any) -> str:
@@ -239,6 +257,24 @@ def spawn_async_diagnostic(
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
         "echo '=== end ==='"
     )
+    timeout_limit = max(1, int(round(timeout_seconds)))
+    timeout_exe = _find_executable("timeout") or _find_executable("gtimeout")
+    bash_exe = _find_executable("bash") or "/bin/bash"
+    if timeout_exe:
+        command = [timeout_exe, str(timeout_limit), bash_exe, "-c", script]
+    else:
+        # Fallback for minimal hosts without GNU coreutils. Keep the wrapper
+        # entirely in bash so launchd/cron PATH omissions cannot suppress the
+        # diagnostic spawn.
+        wrapped_script = (
+            f"set +e; ( {script} ) & _diag_pid=$!; "
+            f"( sleep {timeout_limit}; kill $_diag_pid 2>/dev/null ) & _watchdog_pid=$!; "
+            "wait $_diag_pid; _diag_rc=$?; "
+            "kill $_watchdog_pid 2>/dev/null || true; "
+            "wait $_watchdog_pid 2>/dev/null || true; "
+            "exit $_diag_rc"
+        )
+        command = [bash_exe, "-c", wrapped_script]
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -255,7 +291,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            command,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

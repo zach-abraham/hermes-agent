@@ -461,11 +461,12 @@ class PhotonAdapter(BasePlatformAdapter):
                 backoff = min(backoff * 2, 30.0)
 
     async def _monitor_sidecar_health(self) -> None:
-        """Promote degraded upstream Photon stream health into reconnect.
+        """Recover degraded upstream Photon stream health without gateway exit.
 
         The sidecar HTTP process can stay alive while spectrum-ts repeatedly
         fails to maintain the upstream inbound gRPC stream. Polling `/healthz`
-        keeps that from becoming a silent inbound outage.
+        keeps that from becoming a silent inbound outage; a local sidecar
+        restart is cheaper than making the whole gateway exit.
         """
         while self._inbound_running:
             await asyncio.sleep(self._sidecar_health_interval)
@@ -492,6 +493,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"{last_issue}"
             )
             logger.error("[photon] %s", message)
+            if await self._restart_sidecar_for_degraded_stream(message):
+                continue
             self._set_fatal_error(
                 "UPSTREAM_STREAM_DEGRADED",
                 message,
@@ -502,6 +505,24 @@ class PhotonAdapter(BasePlatformAdapter):
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("[photon] fatal-error notification failed: %s", exc)
             break
+
+    async def _restart_sidecar_for_degraded_stream(self, message: str) -> bool:
+        """Restart only the Photon sidecar after a degraded stream health check.
+
+        The gateway is still healthy in this failure mode; restarting the Node
+        sidecar refreshes the Spectrum stream while the inbound loop reconnects
+        to the same local port. If that narrow repair fails, the caller keeps the
+        old retryable fatal path as a fallback.
+        """
+        logger.warning("[photon] %s; restarting sidecar in-place", message)
+        try:
+            await self._stop_sidecar()
+            await self._start_sidecar()
+        except Exception as exc:
+            logger.error("[photon] sidecar restart after degraded stream failed: %s", exc)
+            return False
+        logger.info("[photon] sidecar restarted after degraded stream health")
+        return True
 
     async def _on_inbound_line(self, line: str) -> None:
         try:

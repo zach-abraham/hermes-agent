@@ -1207,6 +1207,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
+    previous_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    previous_model = (getattr(agent, "model", "") or "").strip()
+    previous_base_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
     fb_key = _fallback_entry_key(fb)
@@ -1348,6 +1351,39 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        try:
+            from agent.agent_init import _custom_provider_extra_body_for_agent
+
+            custom_providers = getattr(agent, "_custom_providers", None) or []
+            stale_extra = _custom_provider_extra_body_for_agent(
+                provider=previous_provider,
+                model=previous_model,
+                base_url=previous_base_url,
+                custom_providers=custom_providers,
+            ) or {}
+            fresh_extra = _custom_provider_extra_body_for_agent(
+                provider=agent.provider,
+                model=agent.model,
+                base_url=agent.base_url,
+                custom_providers=custom_providers,
+            ) or {}
+            if stale_extra or fresh_extra:
+                overrides = dict(getattr(agent, "request_overrides", {}) or {})
+                body = dict(overrides.get("extra_body") or {})
+                for key, value in stale_extra.items():
+                    if body.get(key) == value:
+                        body.pop(key, None)
+                body.update(fresh_extra)
+                if body:
+                    overrides["extra_body"] = body
+                else:
+                    overrides.pop("extra_body", None)
+                agent.request_overrides = overrides
+        except Exception as exc:
+            logger.debug(
+                "Fallback to %s/%s: request override refresh skipped: %s",
+                fb_provider, fb_model, exc,
+            )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

@@ -27,10 +27,13 @@ for the full rationale):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
+import os
 import re
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -53,6 +56,12 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 # positives (activated when not needed). 4.0 errs slightly toward
 # underestimating, which is the safer default.
 CHARS_PER_TOKEN = 4.0
+SEMANTIC_EMBED_MODEL = "nomic-embed-text:v1.5"
+SEMANTIC_EMBED_URL = os.environ.get(
+    "TOOL_SEARCH_EMBED_URL",
+    "http://192.168.8.108:11434/api/embeddings",
+)
+SEMANTIC_EMBED_CACHE = os.path.expanduser("~/.hermes/cache/tool_search_embed_cache.json")
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +77,7 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    semantic_rerank: bool = False
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -105,12 +115,14 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        semantic_rerank = _safe_bool(raw.get("semantic_rerank"), False)
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            semantic_rerank=semantic_rerank,
         )
 
 
@@ -126,6 +138,19 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _safe_bool(value: Any, fallback: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return fallback
 
 
 def load_config() -> ToolSearchConfig:
@@ -418,6 +443,111 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5) -> L
     return [e for _, e in scored[:limit]]
 
 
+def _load_embedding_cache() -> Dict[str, List[float]]:
+    try:
+        with open(SEMANTIC_EMBED_CACHE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): v for k, v in data.items() if isinstance(v, list)}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug("tool_search embedding cache load failed: %s", e)
+    return {}
+
+
+def _save_embedding_cache(cache: Dict[str, List[float]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(SEMANTIC_EMBED_CACHE), exist_ok=True)
+        tmp_path = SEMANTIC_EMBED_CACHE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp_path, SEMANTIC_EMBED_CACHE)
+    except Exception as e:
+        logger.debug("tool_search embedding cache save failed: %s", e)
+
+
+def _embed_text(text: str, cache: Dict[str, List[float]]) -> List[float]:
+    key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    cached = cache.get(key)
+    if cached:
+        return cached
+
+    req = urllib.request.Request(
+        SEMANTIC_EMBED_URL,
+        data=json.dumps({"model": SEMANTIC_EMBED_MODEL, "prompt": text}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = json.loads(resp.read())
+    embedding = raw.get("embedding")
+    if not isinstance(embedding, list) or not embedding:
+        raise RuntimeError("empty embedding response")
+    cache[key] = embedding
+    return embedding
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a <= 0 or norm_b <= 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _bm25_score_map(catalog: List[CatalogEntry], query: str) -> Dict[str, float]:
+    query_tokens = _tokenize(query)
+    doc_lengths = [len(e._tokens) for e in catalog]
+    avg_dl = sum(doc_lengths) / max(len(doc_lengths), 1)
+    doc_freq: Dict[str, int] = {}
+    for e in catalog:
+        for token in set(e._tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+    n_docs = len(catalog)
+    return {
+        entry.name: _bm25_score(query_tokens, entry._tokens, doc_lengths, avg_dl, doc_freq, n_docs)
+        for entry in catalog
+    }
+
+
+def search_catalog_hybrid(catalog: List[CatalogEntry], query: str, limit: int = 5) -> List[CatalogEntry]:
+    """Return top hits using BM25 plus local embedding rerank, fail-open to BM25.
+
+    BM25 remains the reliable lexical baseline. The semantic stage adds a
+    query/document cosine term for vocabulary-mismatch cases and never blocks
+    tool discovery if the local embedding endpoint or cache is unavailable.
+    """
+    if not catalog or limit <= 0:
+        return []
+    if not _tokenize(query):
+        return []
+
+    try:
+        cache = _load_embedding_cache()
+        query_embedding = _embed_text("search_query: " + query, cache)
+        bm25_scores = _bm25_score_map(catalog, query)
+        max_bm25 = max(bm25_scores.values()) if bm25_scores else 0.0
+        if max_bm25 <= 0:
+            max_bm25 = 1.0
+
+        scored: List[Tuple[float, CatalogEntry]] = []
+        for entry in catalog:
+            doc_text = "search_document: " + _entry_search_text(entry.schema)
+            doc_embedding = _embed_text(doc_text, cache)
+            semantic = _cosine(query_embedding, doc_embedding)
+            lexical = bm25_scores.get(entry.name, 0.0) / max_bm25
+            scored.append((0.7 * semantic + 0.3 * lexical, entry))
+        _save_embedding_cache(cache)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for score, entry in scored[:limit] if score > 0]
+    except Exception as e:
+        logger.debug("tool_search semantic rerank failed; falling back to BM25: %s", e)
+        return search_catalog(catalog, query, limit=limit)
+
+
 # ---------------------------------------------------------------------------
 # Bridge tool schemas
 # ---------------------------------------------------------------------------
@@ -621,7 +751,10 @@ def dispatch_tool_search(args: Dict[str, Any],
 
     _, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
-    hits = search_catalog(catalog, query, limit=limit)
+    if config.semantic_rerank:
+        hits = search_catalog_hybrid(catalog, query, limit=limit)
+    else:
+        hits = search_catalog(catalog, query, limit=limit)
     return json.dumps({
         "query": query,
         "total_available": len(catalog),
@@ -725,6 +858,7 @@ __all__ = [
     "should_activate",
     "build_catalog",
     "search_catalog",
+    "search_catalog_hybrid",
     "bridge_tool_schemas",
     "assemble_tool_defs",
     "is_bridge_tool",

@@ -46,6 +46,62 @@ class TestNvidiaProfile:
         assert p.default_headers == {}
 
 
+class TestStrictOpenAICompatibleProfiles:
+    def test_groq_profile_registered(self):
+        p = get_provider_profile("groq")
+        assert p is not None
+        assert p.name == "groq"
+        assert "groq.com" in p.base_url
+
+    def test_cerebras_profile_registered(self):
+        p = get_provider_profile("cerebras")
+        assert p is not None
+        assert p.name == "cerebras"
+        assert "cerebras.ai" in p.base_url
+
+    def test_groq_omits_unsupported_reasoning_extras(self):
+        p = get_provider_profile("groq")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            supports_reasoning=True,
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+        )
+        assert eb == {}
+        assert "reasoning_effort" not in tl
+
+    def test_cerebras_omits_disabled_reasoning_none(self):
+        p = get_provider_profile("cerebras")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            supports_reasoning=True,
+            model="gpt-oss-120b",
+        )
+        assert eb == {}
+        assert "reasoning_effort" not in tl
+
+    def test_transport_profile_path_does_not_emit_reasoning_payloads(self):
+        from agent.transports import get_transport
+
+        transport = get_transport("chat_completions")
+        for provider, model, reasoning_config in (
+            (
+                "groq",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                {"enabled": True, "effort": "medium"},
+            ),
+            ("cerebras", "gpt-oss-120b", {"enabled": False}),
+        ):
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "Hi"}],
+                provider_profile=get_provider_profile(provider),
+                reasoning_config=reasoning_config,
+                supports_reasoning=True,
+            )
+            assert "reasoning_effort" not in kw, provider
+            assert "reasoning" not in kw.get("extra_body", {}), provider
+
+
 class TestKimiProfile:
     def test_temperature_omit(self):
         p = get_provider_profile("kimi")

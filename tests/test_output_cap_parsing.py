@@ -20,6 +20,12 @@ class TestParseOpenRouterOutputCap:
                "input_tokens: 190000 = available_tokens: 10000")
         assert parse_available_output_tokens_from_error(msg) == 10000
 
+    def test_groq_hard_output_cap_format(self):
+        msg = ("HTTP 400: `max_tokens` must be less than or equal to `8192`, "
+               "the maximum value for `max_tokens` is less than the "
+               "`context_window` for this model")
+        assert parse_available_output_tokens_from_error(msg) == 8192
+
     def test_non_output_cap_error_returns_none(self):
         assert parse_available_output_tokens_from_error("some unrelated 400 error") is None
 

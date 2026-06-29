@@ -1139,6 +1139,13 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         "max_tokens" in error_lower
         and ("available_tokens" in error_lower or "available tokens" in error_lower)
     ) or (
+        # Groq / strict OpenAI-compatible providers may report only the
+        # model's hard output cap, e.g. "max_tokens must be less than or equal
+        # to `8192`". This is still an output-cap retry, not a prompt-length
+        # failure.
+        "max_tokens" in error_lower
+        and "less than or equal" in error_lower
+    ) or (
         # OpenRouter/Nous phrasing of the same condition.
         "in the output" in error_lower
         and "maximum context length" in error_lower
@@ -1180,6 +1187,7 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     patterns = [
         r'available_tokens[:\s]+(\d+)',
         r'available\s+tokens[:\s]+(\d+)',
+        r'max_tokens.*less than or equal to [`"\']?(\d+)',
         # fallback: last number after "=" in expressions like "200000 - 190000 = 10000"
         r'=\s*(\d+)\s*$',
     ]

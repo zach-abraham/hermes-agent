@@ -608,6 +608,35 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    session_timeout_counts = {}
+    session_exhausted_backends = set()
+
+    def _current_backend_key():
+        return (
+            (getattr(agent, "provider", "") or "").strip().lower(),
+            (getattr(agent, "model", "") or "").strip(),
+        )
+
+    def _fallback_entry_backend_key(entry):
+        return (
+            (entry.get("provider") or "").strip().lower(),
+            (entry.get("model") or "").strip(),
+        )
+
+    def _drop_session_exhausted_pending_fallbacks():
+        chain = list(getattr(agent, "_fallback_chain", []) or [])
+        if not chain or not session_exhausted_backends:
+            return
+        index = max(0, min(int(getattr(agent, "_fallback_index", 0) or 0), len(chain)))
+        pending = [
+            entry for entry in chain[index:]
+            if _fallback_entry_backend_key(entry) not in session_exhausted_backends
+        ]
+        if len(pending) == len(chain[index:]):
+            return
+        agent._fallback_chain = chain[:index] + pending
+        if index == 0:
+            agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2151,6 +2180,7 @@ def run_conversation(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                session_timeout_counts.pop(_current_backend_key(), None)
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -2479,6 +2509,17 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                _backend_key = _current_backend_key()
+                _session_backend_exhausted = False
+                if classified.reason == FailoverReason.timeout:
+                    _timeout_count = session_timeout_counts.get(_backend_key, 0) + 1
+                    session_timeout_counts[_backend_key] = _timeout_count
+                    if _timeout_count >= 2:
+                        _session_backend_exhausted = True
+                        session_exhausted_backends.add(_backend_key)
+                        _drop_session_exhausted_pending_fallbacks()
+                else:
+                    session_timeout_counts.pop(_backend_key, None)
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -3047,7 +3088,10 @@ def run_conversation(
                 }
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and (retry_count >= 2 or _session_backend_exhausted)
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -3080,6 +3124,10 @@ def run_conversation(
                         elif classified.reason == FailoverReason.billing:
                             agent._buffer_status(
                                 "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                            )
+                        elif _session_backend_exhausted:
+                            agent._buffer_status(
+                                "⚠️ Provider timed out twice this session — switching to fallback provider..."
                             )
                         elif _is_transport_failure:
                             agent._buffer_status(

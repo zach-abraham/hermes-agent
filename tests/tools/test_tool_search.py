@@ -82,6 +82,12 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_semantic_rerank_flag_parsed(self):
+        from tools.tool_search import ToolSearchConfig
+        assert ToolSearchConfig.from_raw({"semantic_rerank": True}).semantic_rerank
+        assert ToolSearchConfig.from_raw({"semantic_rerank": "yes"}).semantic_rerank
+        assert not ToolSearchConfig.from_raw({"semantic_rerank": "no"}).semantic_rerank
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -230,6 +236,36 @@ class TestRetrieval:
         from tools.tool_search import search_catalog
         hits = search_catalog(self._fake_catalog(), "github", limit=1)
         assert len(hits) <= 1
+
+    def test_hybrid_search_recovers_semantic_match(self, monkeypatch):
+        import tools.tool_search as tool_search
+
+        def fake_embed(text, cache):
+            if text.startswith("search_query:"):
+                return [1.0, 0.0]
+            if "slack_send_message" in text or "Slack channel" in text:
+                return [1.0, 0.0]
+            return [0.0, 1.0]
+
+        monkeypatch.setattr(tool_search, "_embed_text", fake_embed)
+        monkeypatch.setattr(tool_search, "_load_embedding_cache", lambda: {})
+        monkeypatch.setattr(tool_search, "_save_embedding_cache", lambda cache: None)
+
+        assert tool_search.search_catalog(self._fake_catalog(), "notify team", limit=3) == []
+        hits = tool_search.search_catalog_hybrid(self._fake_catalog(), "notify team", limit=3)
+        assert hits[0].name == "slack_send_message"
+
+    def test_hybrid_search_fails_open_to_bm25(self, monkeypatch):
+        import tools.tool_search as tool_search
+
+        def fail_embed(text, cache):
+            raise RuntimeError("embed service unavailable")
+
+        monkeypatch.setattr(tool_search, "_embed_text", fail_embed)
+        hits = tool_search.search_catalog_hybrid(
+            self._fake_catalog(), "create a github issue", limit=3,
+        )
+        assert hits[0].name == "github_create_issue"
 
 
 # ---------------------------------------------------------------------------
@@ -535,4 +571,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-

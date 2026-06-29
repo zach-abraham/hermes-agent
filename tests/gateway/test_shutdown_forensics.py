@@ -177,6 +177,30 @@ class TestSpawnAsyncDiagnostic:
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
+    def test_spawns_with_stripped_launchd_path(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "diag.log"
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)
+        assert pid is not None and pid > 0
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if log_path.exists() and log_path.stat().st_size > 0:
+                time.sleep(0.5)
+                break
+            time.sleep(0.1)
+
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+
+        assert log_path.exists()
+        contents = log_path.read_text(encoding="utf-8", errors="replace")
+        assert "shutdown diagnostic" in contents
+        assert "SIGTERM" in contents
+
     def test_returns_none_on_windows(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sf, "sys", type("M", (), {"platform": "win32"})())
         result = sf.spawn_async_diagnostic(

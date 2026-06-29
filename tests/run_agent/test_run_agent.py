@@ -4325,6 +4325,49 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["final_response"] == "Fallback answer."
 
+    def test_repeated_timeouts_open_session_circuit_before_third_retry(self, agent):
+        """Two same-backend transport timeouts should skip to fallback immediately."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent.model = "primary-timeout-model"
+        agent.provider = "custom"
+        agent._api_max_retries = 3
+        agent._fallback_chain = [{"provider": "openrouter", "model": "fallback-model"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+
+        class APITimeoutError(Exception):
+            pass
+
+        content_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            APITimeoutError("provider read timeout"),
+            APITimeoutError("provider read timeout"),
+            content_resp,
+        ]
+        fallback_reasons = []
+
+        def _mock_fallback(reason=None):
+            fallback_reasons.append(reason)
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "fallback-model"
+            agent.provider = "openrouter"
+            return True
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert fallback_reasons == [FailoverReason.timeout]
+        assert agent.client.chat.completions.create.call_count == 3
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback answer."
+
     def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""
         self._setup_agent(agent)
@@ -6388,6 +6431,46 @@ class TestFallbackAnthropicProvider:
         assert result is True
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
+
+    def test_fallback_clears_stale_custom_provider_extra_body(self, agent):
+        agent.provider = "custom"
+        agent.model = "deepseek-r1:8b"
+        agent.base_url = "http://127.0.0.1:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.request_overrides = {
+            "extra_body": {
+                "reasoning_effort": "none",
+                "preserve_user_override": True,
+            }
+        }
+        agent._custom_providers = [
+            {
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "deepseek-r1:8b",
+                "extra_body": {"reasoning_effort": "none"},
+            }
+        ]
+        agent._fallback_activated = False
+        agent._fallback_model = {"provider": "groq", "model": "llama-3.1-8b-instant"}
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.groq.com/openai/v1"
+        mock_client.api_key = "gsk-test"
+
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.provider == "groq"
+        assert agent.client is mock_client
+        assert agent.request_overrides == {
+            "extra_body": {"preserve_user_override": True}
+        }
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "reasoning_effort" not in kwargs
+        assert kwargs.get("extra_body", {}).get("reasoning_effort") is None
 
 
 def test_aiagent_uses_copilot_acp_client():
