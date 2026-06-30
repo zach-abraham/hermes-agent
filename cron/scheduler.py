@@ -478,6 +478,98 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _cron_provider_gate_script() -> Optional[Path]:
+    """Return the optional external provider gate script.
+
+    The gate is deliberately external to the vendor tree so local operators can
+    enforce reset-aware provider policy without forking scheduler internals. Set
+    HERMES_CRON_PROVIDER_GATE=off to disable. If the env var is unset, a
+    profile-local script wins, then the shared ~/.hermes/scripts script.
+    """
+    raw = os.getenv("HERMES_CRON_PROVIDER_GATE", "").strip()
+    if raw.lower() in {"0", "false", "off", "disabled", "none"}:
+        return None
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    else:
+        candidates.extend(
+            [
+                _get_hermes_home() / "scripts" / "cron_provider_gate.py",
+                Path.home() / ".hermes" / "scripts" / "cron_provider_gate.py",
+            ]
+        )
+    for path in candidates:
+        try:
+            if path.exists() and path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _gate_safe_route(entry: object) -> object:
+    """Return a route entry stripped of inline secrets before gate subprocess use."""
+    if isinstance(entry, dict):
+        return {
+            key: _gate_safe_route(value)
+            for key, value in entry.items()
+            if key not in {"api_key", "access_token", "token", "password", "secret"}
+        }
+    if isinstance(entry, list):
+        return [_gate_safe_route(item) for item in entry]
+    return entry
+
+
+def _run_cron_provider_gate(job: dict, resolved: dict) -> dict | None:
+    script = _cron_provider_gate_script()
+    if script is None:
+        return None
+    payload = {
+        "job": {
+            "id": job.get("id"),
+            "name": job.get("name"),
+            "prompt": job.get("prompt"),
+            "script": job.get("script"),
+            "deliver": job.get("deliver"),
+            "enabled_toolsets": job.get("enabled_toolsets"),
+            "skills": job.get("skills"),
+            "no_agent": bool(job.get("no_agent")),
+            "provider": job.get("provider"),
+            "model": job.get("model"),
+            "base_url": job.get("base_url"),
+        },
+        "resolved": _gate_safe_route(resolved),
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--job-json", "-", "--json"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=float(os.getenv("HERMES_CRON_PROVIDER_GATE_TIMEOUT", "8")),
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+    except Exception as exc:
+        logger.warning("Cron provider gate failed open for job '%s': %s", job.get("id"), exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "Cron provider gate exited %s for job '%s': %s",
+            proc.returncode,
+            job.get("id"),
+            (proc.stderr or proc.stdout or "").strip()[:300],
+        )
+        return None
+    try:
+        verdict = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning("Cron provider gate returned invalid JSON for job '%s': %s", job.get("id"), exc)
+        return None
+    return verdict if isinstance(verdict, dict) else None
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata.
 
@@ -2719,6 +2811,61 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 native_route["adapter"],
             )
 
+        fallback_model = get_fallback_chain(_cfg) or None
+        _gate_verdict = _run_cron_provider_gate(
+            job,
+            {
+                "provider": runtime_requested_provider,
+                "model": model,
+                "base_url": runtime_explicit_base_url,
+                "fallback_providers": fallback_model,
+                "provider_routing": pr,
+            },
+        )
+        if isinstance(_gate_verdict, dict):
+            if _gate_verdict.get("admitted") is False:
+                _reason = str(_gate_verdict.get("reason") or "provider gate deferred this cron")
+                _defer_until = _gate_verdict.get("defer_until")
+                logger.info(
+                    "Job '%s': provider gate deferred before model call: %s",
+                    job_id,
+                    _reason,
+                )
+                deferred_doc = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    "**Status:** deferred by provider gate\n\n"
+                    f"{_reason}\n"
+                )
+                if _defer_until:
+                    deferred_doc += f"\n**Next known reset:** {_defer_until}\n"
+                deferred_doc += "\nNo inference call was made.\n"
+                return True, deferred_doc, SILENT_MARKER, None
+
+            _selected = _gate_verdict.get("selected")
+            if isinstance(_selected, dict):
+                _prior_provider = str(runtime_requested_provider or "").strip()
+                _provider = str(_selected.get("provider") or "").strip()
+                _model = str(_selected.get("model") or "").strip()
+                _base_url = str(_selected.get("base_url") or "").strip()
+                if _provider:
+                    runtime_requested_provider = _provider
+                if _model:
+                    model = _model
+                if _base_url:
+                    runtime_explicit_base_url = _base_url
+                elif _provider and _provider != _prior_provider:
+                    runtime_explicit_base_url = None
+                logger.info(
+                    "Job '%s': provider gate selected provider=%s model=%s source=%s tier=%s",
+                    job_id,
+                    runtime_requested_provider,
+                    model,
+                    _selected.get("source"),
+                    _selected.get("tier"),
+                )
+
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
@@ -2822,7 +2969,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"(or pin the original values to keep them). See #44585."
             )
 
-        fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
