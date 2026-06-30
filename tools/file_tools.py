@@ -1870,12 +1870,21 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": (
+        "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. "
+        "Keep inline content under ~200 lines / ~8 KB; for larger or dynamically built content, use execute_code with "
+        "hermes_tools.write_file(path, content), or write a generator script and run it, so the content is not truncated out of the tool-call arguments. "
+        "Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. "
+        "Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out)."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-            "content": {"type": "string", "description": "Complete content to write to the file"},
+            "content": {
+                "type": "string",
+                "description": "Complete content to write to the file. Keep inline payloads under ~200 lines / ~8 KB; use execute_code with hermes_tools.write_file(path, content) for larger generated content.",
+            },
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",

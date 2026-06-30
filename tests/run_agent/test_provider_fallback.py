@@ -5,6 +5,7 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
@@ -34,6 +35,18 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock.base_url = base_url
     mock.api_key = api_key
     return mock
+
+
+def _write_tool_contract_snapshot(path, providers):
+    path.write_text(
+        json.dumps(
+            {
+                "ts": "2099-01-01T00:00:00+00:00",
+                "providers": providers,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 # ── Chain initialisation ──────────────────────────────────────────────────
@@ -334,3 +347,143 @@ class TestFallbackChainDedup:
 
         assert ok is False
         mock_resolve.assert_not_called()
+
+
+class TestToolRequiredFallbackFilter:
+    def test_skips_local_fallback_without_tool_contract_for_tool_request(self, tmp_path):
+        snapshot = tmp_path / "provider_tool_contracts_snapshot.json"
+        _write_tool_contract_snapshot(
+            snapshot,
+            [
+                {
+                    "provider": "ollama_local",
+                    "model": "deepseek-r1:8b",
+                    "base_url": "http://192.168.8.108:11434/v1",
+                    "capabilities": {"tool_calls_ok": "unknown"},
+                    "live_probe": {
+                        "ok": False,
+                        "error": "registry.ollama.ai/library/deepseek-r1:8b does not support tools",
+                        "model_metadata": {"tools_capability": False},
+                    },
+                }
+            ],
+        )
+        fbs = [
+            {
+                "provider": "ollama_local",
+                "model": "deepseek-r1:8b",
+                "base_url": "http://192.168.8.108:11434/v1",
+            },
+            {"provider": "openai", "model": "gpt-4o"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._current_api_request_has_tools = True
+
+        called = []
+
+        def _resolve(provider, model=None, raw_codex=False, explicit_base_url=None, **kwargs):
+            called.append((provider, model, explicit_base_url))
+            if provider == "ollama_local":
+                return _mock_client(base_url=explicit_base_url), model
+            return _mock_client(), model
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._TOOL_CONTRACT_SNAPSHOT_PATH",
+                str(snapshot),
+            ),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            ok = agent._try_activate_fallback()
+
+        assert ok is True
+        assert called == [
+            ("ollama_local", "deepseek-r1:8b", "http://192.168.8.108:11434/v1"),
+            ("openai", "gpt-4o", None),
+        ]
+        assert agent.provider == "openai"
+        assert agent.model == "gpt-4o"
+        assert "no_tool_capable_fallback" in agent._last_fallback_skip_reason
+
+    def test_allows_local_fallback_for_text_only_request_without_snapshot(self, tmp_path):
+        missing_snapshot = tmp_path / "missing.json"
+        fbs = [
+            {
+                "provider": "ollama_local",
+                "model": "deepseek-r1:8b",
+                "base_url": "http://192.168.8.108:11434/v1",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._current_api_request_has_tools = False
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._TOOL_CONTRACT_SNAPSHOT_PATH",
+                str(missing_snapshot),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="http://192.168.8.108:11434/v1"),
+                    "deepseek-r1:8b",
+                ),
+            ),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            ok = agent._try_activate_fallback()
+
+        assert ok is True
+        assert agent.provider == "ollama_local"
+        assert agent.model == "deepseek-r1:8b"
+
+    def test_allows_verified_native_ollama_fallback_for_tool_request(self, tmp_path):
+        snapshot = tmp_path / "provider_tool_contracts_snapshot.json"
+        _write_tool_contract_snapshot(
+            snapshot,
+            [
+                {
+                    "provider": "ollama_native_local",
+                    "model": "qwen3:8b",
+                    "base_url": "http://192.168.8.108:11434",
+                    "capabilities": {"tool_calls_ok": "unknown"},
+                    "live_probe": {
+                        "ok": False,
+                        "model_metadata": {"tools_capability": True},
+                        "ollama_native_probe": {"tool_calls_ok": True},
+                    },
+                }
+            ],
+        )
+        fbs = [
+            {
+                "provider": "ollama_native_local",
+                "model": "qwen3:8b",
+                "base_url": "http://192.168.8.108:11434",
+                "api_mode": "ollama_native_chat",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._current_api_request_has_tools = True
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._TOOL_CONTRACT_SNAPSHOT_PATH",
+                str(snapshot),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="http://192.168.8.108:11434"),
+                    "qwen3:8b",
+                ),
+            ),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+        ):
+            ok = agent._try_activate_fallback()
+
+        assert ok is True
+        assert agent.provider == "ollama_native_local"
+        assert agent.model == "qwen3:8b"
+        assert getattr(agent, "_last_fallback_skip_reason", None) is None

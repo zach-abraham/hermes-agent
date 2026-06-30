@@ -4,11 +4,12 @@ import contextlib
 import json
 import logging
 import os
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_job_script
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -75,6 +76,54 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronScriptProviderEnv:
+    def test_no_agent_provider_env_passthrough_is_explicit_and_narrow(self, tmp_path, monkeypatch):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                [
+                    "OPENROUTER_API_KEY=or-secret",
+                    "SAMBANOVA_API_KEY=sb-secret",
+                    "TELEGRAM_BOT_TOKEN=bot-secret",
+                ]
+            )
+            + "\n"
+        )
+        script = scripts / "probe_env.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({\n"
+            "  'openrouter': bool(os.getenv('OPENROUTER_API_KEY')),\n"
+            "  'sambanova': bool(os.getenv('SAMBANOVA_API_KEY')),\n"
+            "  'telegram': bool(os.getenv('TELEGRAM_BOT_TOKEN')),\n"
+            "}))\n"
+        )
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("SAMBANOVA_API_KEY", raising=False)
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            ok, raw = _run_job_script("probe_env.py")
+            assert ok is True
+            assert json.loads(raw) == {
+                "openrouter": False,
+                "sambanova": False,
+                "telegram": False,
+            }
+
+            ok, raw = _run_job_script(
+                "probe_env.py",
+                provider_env_passthrough=["OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN"],
+            )
+            assert ok is True
+            assert json.loads(raw) == {
+                "openrouter": True,
+                "sambanova": False,
+                "telegram": False,
+            }
 
 
 class TestResolveOrigin:
@@ -1159,6 +1208,59 @@ class TestRunJobSessionPersistence:
         assert success is False
         assert final_response == ""
         assert "RuntimeError: boom" in error
+        mock_agent.close.assert_called_once()
+
+    def test_run_job_wall_timeout_stops_active_agent(self, tmp_path, monkeypatch):
+        # Inactivity timeout alone does not stop an agent that keeps reporting
+        # activity. The wall-clock cap must fail the run anyway so manual
+        # `hermes cron run` cannot hang indefinitely.
+        job = {
+            "id": "wall-timeout-job",
+            "name": "wall-timeout",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+        monkeypatch.setenv("HERMES_CRON_WALL_TIMEOUT", "0.1")
+        monkeypatch.setenv("HERMES_CRON_INTERRUPT_GRACE", "0.01")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.get_activity_summary.return_value = {
+                "seconds_since_activity": 0.0,
+                "last_activity_desc": "tool_call",
+                "current_tool": "terminal",
+                "api_call_count": 2,
+                "max_iterations": 90,
+            }
+
+            def _slow_active(_prompt):
+                time.sleep(1.0)
+                return {"final_response": "late"}
+
+            mock_agent.run_conversation.side_effect = _slow_active
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "wall-clock timeout" in error
+        assert "terminal" in error
+        mock_agent.interrupt.assert_called_once()
         mock_agent.close.assert_called_once()
 
     def test_run_job_reaps_stale_auxiliary_clients_per_tick(self, tmp_path):

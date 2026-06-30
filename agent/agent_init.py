@@ -144,6 +144,30 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
+def _custom_provider_model_config_for_agent(
+    *,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    target_url = _normalized_custom_base_url(base_url)
+    if not model or not target_url:
+        return None
+
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
+            continue
+        models = entry.get("models")
+        if not isinstance(models, dict):
+            continue
+        model_cfg = models.get(model)
+        if isinstance(model_cfg, dict):
+            return model_cfg
+    return None
+
+
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
@@ -1542,6 +1566,25 @@ def init_agent(
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
     _merge_custom_provider_extra_body(agent, _custom_providers)
+    _custom_provider_model_cfg = _custom_provider_model_config_for_agent(
+        model=agent.model,
+        base_url=agent.base_url,
+        custom_providers=_custom_providers,
+    )
+
+    # A named provider/model override is more specific than the global
+    # ``model.context_length`` block. Cron native-Ollama routes resolve to the
+    # provider endpoint directly, so this keeps the displayed context aligned
+    # with the route-specific runtime window.
+    if isinstance(_custom_provider_model_cfg, dict):
+        _cp_context_length = _custom_provider_model_cfg.get("context_length")
+        if _cp_context_length is not None:
+            try:
+                _parsed_cp_context_length = int(_cp_context_length)
+                if _parsed_cp_context_length > 0:
+                    _config_context_length = _parsed_cp_context_length
+            except (TypeError, ValueError):
+                pass
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
@@ -1843,6 +1886,8 @@ def init_agent(
     _ollama_num_ctx_override = None
     if isinstance(_model_cfg, dict):
         _ollama_num_ctx_override = _model_cfg.get("ollama_num_ctx")
+    if _ollama_num_ctx_override is None and isinstance(_custom_provider_model_cfg, dict):
+        _ollama_num_ctx_override = _custom_provider_model_cfg.get("ollama_num_ctx")
     if _ollama_num_ctx_override is not None:
         try:
             agent._ollama_num_ctx = int(_ollama_num_ctx_override)

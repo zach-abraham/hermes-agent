@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -566,6 +568,102 @@ def _run_cron_provider_gate(job: dict, resolved: dict) -> dict | None:
         logger.warning("Cron provider gate returned invalid JSON for job '%s': %s", job.get("id"), exc)
         return None
     return verdict if isinstance(verdict, dict) else None
+
+
+def _parse_cron_seconds_limit(value: object, *, default: float | None, label: str) -> float | None:
+    """Parse a cron timeout setting.
+
+    Positive values are seconds. ``0`` or a negative value means unlimited.
+    Invalid/missing values fall back to ``default``.
+    """
+    if value in (None, ""):
+        return default
+    try:
+        seconds = float(str(value).strip())
+    except (ValueError, TypeError):
+        logger.warning("Invalid %s=%r; using default %s", label, value, default)
+        return default
+    return seconds if seconds > 0 else None
+
+
+def _cron_limit_from_job_env_config(
+    *,
+    job: dict,
+    cfg: dict,
+    env_name: str,
+    job_keys: tuple[str, ...],
+    config_key: str,
+    default: float | None,
+) -> float | None:
+    raw_env = os.getenv(env_name, "").strip()
+    if raw_env:
+        return _parse_cron_seconds_limit(raw_env, default=default, label=env_name)
+    for key in job_keys:
+        if job.get(key) not in (None, ""):
+            return _parse_cron_seconds_limit(job.get(key), default=default, label=f"job.{key}")
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    if cron_cfg.get(config_key) not in (None, ""):
+        return _parse_cron_seconds_limit(
+            cron_cfg.get(config_key),
+            default=default,
+            label=f"cron.{config_key}",
+        )
+    return default
+
+
+def _agent_activity_summary(agent: object) -> dict:
+    if hasattr(agent, "get_activity_summary"):
+        try:
+            summary = agent.get_activity_summary()
+            return summary if isinstance(summary, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _write_cron_agent_progress(
+    job_id: str,
+    job_name: str,
+    *,
+    status: str,
+    started_monotonic: float,
+    inactivity_limit: float | None,
+    wall_limit: float | None,
+    activity: dict | None = None,
+    detail: str | None = None,
+) -> None:
+    """Persist lightweight run progress so a hung cron has observable proof."""
+    try:
+        progress_dir = _get_hermes_home() / "cron" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": job_id,
+            "job_name": job_name,
+            "status": status,
+            "updated_at": _hermes_now().isoformat(),
+            "elapsed_s": round(max(0.0, time.monotonic() - started_monotonic), 2),
+            "limits": {
+                "inactivity_timeout_s": inactivity_limit,
+                "wall_timeout_s": wall_limit,
+            },
+            "activity": activity or {},
+        }
+        if detail:
+            payload["detail"] = detail
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(progress_dir),
+            prefix=f"{job_id}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            tmp = Path(fh.name)
+        tmp.replace(progress_dir / f"{job_id}.latest.json")
+    except Exception as exc:
+        logger.debug("Job '%s': failed to write cron progress: %s", job_id, exc)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1213,6 +1311,22 @@ def _normalize_deliver_value(deliver) -> str:
 # comes online.  ``all`` expands into the set of connected platforms
 # (those with a configured home chat_id) in _expand_routing_tokens.
 _ROUTING_TOKENS = frozenset({"all"})
+
+
+_CRON_SCRIPT_PROVIDER_ENV_ALLOWLIST = frozenset({
+    "CEREBRAS_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "NVIDIA_API_KEY",
+    "NVIDIA_NIM_API_KEY",
+    "OLLAMA_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "SAMBANOVA_API_KEY",
+    "ZAI_API_KEY",
+    "ZAI_GLM_API_KEY",
+})
 
 
 def _expand_routing_tokens(part: str) -> List[str]:
@@ -1919,7 +2033,76 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _normalize_script_provider_env_passthrough(job: dict | None) -> list[str]:
+    """Return job-approved provider env vars a no-agent script may receive."""
+    raw = (job or {}).get("provider_env_passthrough")
+    if not isinstance(raw, list):
+        return []
+    names: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if name in _CRON_SCRIPT_PROVIDER_ENV_ALLOWLIST:
+            names.add(name)
+        elif name:
+            logger.warning(
+                "Ignoring disallowed provider_env_passthrough entry %r for cron job %r",
+                name,
+                (job or {}).get("id"),
+            )
+    return sorted(names)
+
+
+def _script_subprocess_env(provider_env_passthrough: list[str] | None = None) -> dict:
+    """Build the sanitized environment for a cron script subprocess.
+
+    Cron scripts normally inherit the same stripped environment as terminal
+    subprocesses. A no-agent job may opt into a narrow set of provider keys via
+    ``provider_env_passthrough``; those values are loaded from the active
+    Hermes ``.env`` and passed through with the existing _HERMES_FORCE_ escape
+    hatch, so the exception remains explicit and auditable.
+    """
+    from tools.environments.local import _sanitize_subprocess_env
+
+    env = os.environ.copy()
+    env_path = _get_hermes_home() / ".env"
+    if env_path.exists():
+        try:
+            from dotenv import dotenv_values
+
+            try:
+                values = dotenv_values(str(env_path), encoding="utf-8")
+            except UnicodeDecodeError:
+                values = dotenv_values(str(env_path), encoding="latin-1")
+            for key, value in values.items():
+                if key and value is not None:
+                    env[str(key)] = str(value)
+        except Exception as exc:
+            logger.debug("Cron script dotenv load skipped for %s: %s", env_path, exc)
+
+    allowed = {
+        name
+        for name in (provider_env_passthrough or [])
+        if name in _CRON_SCRIPT_PROVIDER_ENV_ALLOWLIST
+    }
+    extra_env = {}
+    for name in allowed:
+        value = env.get(name)
+        if value:
+            extra_env[f"_HERMES_FORCE_{name}"] = value
+
+    sanitized = _sanitize_subprocess_env(env, extra_env=extra_env)
+    for name in _CRON_SCRIPT_PROVIDER_ENV_ALLOWLIST - allowed:
+        sanitized.pop(name, None)
+    return sanitized
+
+
+def _run_job_script(
+    script_path: str,
+    *,
+    provider_env_passthrough: list[str] | None = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1945,6 +2128,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        provider_env_passthrough: Explicit provider credential names this
+            trusted script may receive. Values are loaded from Hermes .env and
+            still filtered through the normal subprocess sanitizer.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2002,8 +2188,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         argv = [sys.executable, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
-
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
             argv,
@@ -2011,7 +2195,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_script_subprocess_env(provider_env_passthrough),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -2436,7 +2620,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(
+                script_path,
+                provider_env_passthrough=_normalize_script_provider_env_passthrough(job),
+            )
         finally:
             if _prior_cwd is not None:
                 try:
@@ -3044,92 +3231,193 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_db=_session_db,
         )
         
-        # Run the agent with an *inactivity*-based timeout: the job can run
-        # for hours if it's actively calling tools / receiving stream tokens,
-        # but a hung API call or stuck tool with no activity for the configured
-        # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # Run the agent with two deadlines:
+        #   - inactivity timeout: no API/tool/stream activity for N seconds
+        #   - wall timeout: total run duration cap, even if it keeps making
+        #     progress forever
         #
-        # Uses the agent's built-in activity tracker (updated by
-        # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
-        _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+        # HERMES_CRON_TIMEOUT keeps its historical meaning: inactivity timeout.
+        # HERMES_CRON_WALL_TIMEOUT is the hard wall-clock cap. Job-level fields
+        # may also set inactivity_timeout_seconds or wall_timeout_seconds.
+        #
+        # Use a daemon worker thread so a timed-out manual `hermes cron run`
+        # cannot keep the CLI process alive forever. Python cannot force-kill a
+        # thread blocked in provider/tool I/O, so we interrupt the agent and wait
+        # a short grace period before returning a recorded failure.
+        _cron_inactivity_limit = _cron_limit_from_job_env_config(
+            job=job,
+            cfg=_cfg,
+            env_name="HERMES_CRON_TIMEOUT",
+            job_keys=("inactivity_timeout_seconds", "cron_inactivity_timeout_seconds"),
+            config_key="inactivity_timeout_seconds",
+            default=600.0,
+        )
+        _cron_wall_limit = _cron_limit_from_job_env_config(
+            job=job,
+            cfg=_cfg,
+            env_name="HERMES_CRON_WALL_TIMEOUT",
+            job_keys=("wall_timeout_seconds", "timeout_seconds", "cron_timeout_seconds"),
+            config_key="wall_timeout_seconds",
+            default=1800.0,
+        )
+        _cron_interrupt_grace = _cron_limit_from_job_env_config(
+            job=job,
+            cfg=_cfg,
+            env_name="HERMES_CRON_INTERRUPT_GRACE",
+            job_keys=("interrupt_grace_seconds",),
+            config_key="interrupt_grace_seconds",
+            default=20.0,
+        )
         _POLL_INTERVAL = 5.0
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
-        try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — just wait for the result.
-                result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
+        _started_monotonic = time.monotonic()
+        _write_cron_agent_progress(
+            job_id,
+            job_name,
+            status="running",
+            started_monotonic=_started_monotonic,
+            inactivity_limit=_cron_inactivity_limit,
+            wall_limit=_cron_wall_limit,
+            activity=_agent_activity_summary(agent),
+        )
+        _cron_done = threading.Event()
+        _cron_result: dict[str, object] = {}
 
-        if _inactivity_timeout:
+        def _run_agent_worker() -> None:
+            try:
+                _cron_result["result"] = _cron_context.run(agent.run_conversation, prompt)
+            except BaseException as exc:
+                _cron_result["exception"] = exc
+            finally:
+                _cron_done.set()
+
+        _cron_thread = threading.Thread(
+            target=_run_agent_worker,
+            name=f"hermes-cron-agent-{job_id}",
+            daemon=True,
+        )
+        _cron_thread.start()
+        _inactivity_timeout = False
+        _wall_timeout = False
+        result = None
+        _last_progress_log = 0.0
+        while True:
+            _elapsed_before_wait = time.monotonic() - _started_monotonic
+            if _cron_wall_limit is not None and _elapsed_before_wait >= _cron_wall_limit:
+                _wall_timeout = True
+                break
+            _wait_timeout = _POLL_INTERVAL
+            if _cron_wall_limit is not None:
+                _wait_timeout = min(
+                    _wait_timeout,
+                    max(0.0, _cron_wall_limit - _elapsed_before_wait),
+                )
+            if _cron_done.wait(timeout=_wait_timeout):
+                if "exception" in _cron_result:
+                    raise _cron_result["exception"]  # type: ignore[misc]
+                result = _cron_result.get("result")
+                _write_cron_agent_progress(
+                    job_id,
+                    job_name,
+                    status="completed",
+                    started_monotonic=_started_monotonic,
+                    inactivity_limit=_cron_inactivity_limit,
+                    wall_limit=_cron_wall_limit,
+                    activity=_agent_activity_summary(agent),
+                )
+                break
+
+            _elapsed = time.monotonic() - _started_monotonic
+            _activity = _agent_activity_summary(agent)
+            _idle_secs = float(_activity.get("seconds_since_activity") or 0.0)
+            if _elapsed - _last_progress_log >= 60.0:
+                _last_progress_log = _elapsed
+                logger.info(
+                    "Job '%s' still running: elapsed=%.0fs idle=%.0fs last_activity=%s tool=%s",
+                    job_id,
+                    _elapsed,
+                    _idle_secs,
+                    _activity.get("last_activity_desc") or "unknown",
+                    _activity.get("current_tool") or "none",
+                )
+                _write_cron_agent_progress(
+                    job_id,
+                    job_name,
+                    status="running",
+                    started_monotonic=_started_monotonic,
+                    inactivity_limit=_cron_inactivity_limit,
+                    wall_limit=_cron_wall_limit,
+                    activity=_activity,
+                )
+            if _cron_wall_limit is not None and _elapsed >= _cron_wall_limit:
+                _wall_timeout = True
+                break
+            if _cron_inactivity_limit is not None and _idle_secs >= _cron_inactivity_limit:
+                _inactivity_timeout = True
+                break
+
+        if _inactivity_timeout or _wall_timeout:
             # Build diagnostic summary from the agent's activity tracker.
-            _activity = {}
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _activity = agent.get_activity_summary()
-                except Exception:
-                    pass
+            _activity = _agent_activity_summary(agent)
             _last_desc = _activity.get("last_activity_desc", "unknown")
             _secs_ago = _activity.get("seconds_since_activity", 0)
             _cur_tool = _activity.get("current_tool")
             _iter_n = _activity.get("api_call_count", 0)
             _iter_max = _activity.get("max_iterations", 0)
+            _elapsed = time.monotonic() - _started_monotonic
+            _timeout_kind = "wall-clock" if _wall_timeout else "inactivity"
+            _limit = _cron_wall_limit if _wall_timeout else _cron_inactivity_limit
 
             logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
+                "Job '%s' hit %s timeout: elapsed=%.0fs idle=%.0fs limit=%.0fs "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
+                job_name,
+                _timeout_kind,
+                _elapsed,
+                _secs_ago,
+                _limit or 0,
+                _last_desc,
+                _iter_n,
+                _iter_max,
                 _cur_tool or "none",
             )
             if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
+                agent.interrupt(f"Cron job timed out ({_timeout_kind})")
+            _write_cron_agent_progress(
+                job_id,
+                job_name,
+                status="timeout_interrupting",
+                started_monotonic=_started_monotonic,
+                inactivity_limit=_cron_inactivity_limit,
+                wall_limit=_cron_wall_limit,
+                activity=_activity,
+                detail=f"{_timeout_kind} timeout; interrupt requested",
+            )
+            if _cron_interrupt_grace is not None:
+                _cron_done.wait(timeout=_cron_interrupt_grace)
+            if _cron_done.is_set():
+                if "exception" in _cron_result:
+                    raise _cron_result["exception"]  # type: ignore[misc]
+                result = _cron_result.get("result")
+            else:
+                _write_cron_agent_progress(
+                    job_id,
+                    job_name,
+                    status="timeout_thread_detached",
+                    started_monotonic=_started_monotonic,
+                    inactivity_limit=_cron_inactivity_limit,
+                    wall_limit=_cron_wall_limit,
+                    activity=_agent_activity_summary(agent),
+                    detail="agent worker did not stop during interrupt grace; recorded failure and detached daemon thread",
+                )
             raise TimeoutError(
-                f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
-                f"— last activity: {_last_desc}"
+                f"Cron job '{job_name}' hit {_timeout_kind} timeout after "
+                f"{int(_elapsed)}s (limit {int(_limit or 0)}s); "
+                f"idle {int(_secs_ago)}s; last activity: {_last_desc}; "
+                f"tool: {_cur_tool or 'none'}; iteration: {_iter_n}/{_iter_max}"
             )
 
         # Guard against non-dict returns from run_conversation under error conditions

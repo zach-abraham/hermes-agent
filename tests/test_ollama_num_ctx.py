@@ -134,6 +134,58 @@ class TestQueryOllamaNumCtx:
         assert result is None
 
 
+class TestOllamaNumCtxConfigOverrides:
+    """Test route-specific Ollama context overrides during agent init."""
+
+    def test_provider_model_override_wins_over_global_model_config(self):
+        from run_agent import AIAgent
+
+        config = {
+            "model": {
+                "default": "deepseek-r1:8b",
+                "provider": "ollama_local",
+                "base_url": "http://192.168.8.108:11434/v1",
+                "context_length": 131072,
+            },
+            "providers": {
+                "ollama_native_local": {
+                    "name": "ollama_native_local",
+                    "base_url": "http://192.168.8.108:11434",
+                    "default_model": "qwen3:8b",
+                    "api_mode": "ollama_native_chat",
+                    "models": {
+                        "qwen3:8b": {
+                            "context_length": 65536,
+                            "ollama_num_ctx": 65536,
+                        }
+                    },
+                }
+            },
+        }
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=config),
+            patch("agent.agent_init.query_ollama_num_ctx", return_value=40960) as probe,
+        ):
+            agent = AIAgent(
+                model="qwen3:8b",
+                api_key="ollama",
+                provider="custom",
+                base_url="http://192.168.8.108:11434",
+                api_mode="ollama_native_chat",
+                enabled_toolsets=[],
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cron",
+            )
+
+        assert agent._config_context_length == 65536
+        assert agent.context_compressor.context_length == 65536
+        assert agent._ollama_num_ctx == 65536
+        probe.assert_not_called()
+
+
 class TestQueryOllamaSupportsVision:
     """Test Ollama /api/show vision capability detection."""
 

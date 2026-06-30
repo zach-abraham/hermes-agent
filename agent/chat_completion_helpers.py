@@ -22,6 +22,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -50,6 +51,10 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+_TOOL_CONTRACT_SNAPSHOT_PATH = os.path.expanduser(
+    "~/.hermes/state/provider_tool_contracts_snapshot.json"
+)
+_TOOL_CONTRACT_SNAPSHOT_MAX_AGE_S = 24 * 60 * 60
 
 
 def _ra():
@@ -606,6 +611,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+    try:
+        agent._current_api_request_has_tools = bool(tools_for_api)
+    except Exception:
+        pass
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1168,6 +1177,127 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _parse_tool_contract_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_fresh_tool_contract_snapshot() -> tuple[dict | None, str | None]:
+    try:
+        with open(_TOOL_CONTRACT_SNAPSHOT_PATH, "r", encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+    except FileNotFoundError:
+        return None, "missing provider_tool_contracts_snapshot"
+    except Exception as exc:
+        return None, f"unreadable provider_tool_contracts_snapshot: {exc}"
+    ts = _parse_tool_contract_ts(snapshot.get("ts") or snapshot.get("timestamp"))
+    if ts is None:
+        return None, "provider_tool_contracts_snapshot has no parseable ts"
+    age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age_s < 0:
+        age_s = 0
+    if age_s > _TOOL_CONTRACT_SNAPSHOT_MAX_AGE_S:
+        return None, f"provider_tool_contracts_snapshot stale ({int(age_s)}s)"
+    return snapshot, None
+
+
+def _normalized_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/").lower()
+
+
+def _find_tool_contract_record(
+    snapshot: dict,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+) -> dict | None:
+    provider = (provider or "").strip().lower()
+    model = (model or "").strip()
+    base_url = _normalized_url(base_url)
+    for record in snapshot.get("providers") or []:
+        if not isinstance(record, dict):
+            continue
+        rec_provider = str(record.get("provider") or "").strip().lower()
+        rec_model = str(record.get("model") or "").strip()
+        rec_base_url = _normalized_url(record.get("base_url"))
+        if base_url and rec_base_url == base_url and (not model or rec_model == model):
+            return record
+        if provider and model and rec_provider == provider and rec_model == model:
+            return record
+    return None
+
+
+def _tool_contract_record_supports_tools(record: dict, *, api_mode: str = "") -> bool:
+    capabilities = record.get("capabilities") if isinstance(record, dict) else {}
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    live_probe = record.get("live_probe") if isinstance(record, dict) else {}
+    live_probe = live_probe if isinstance(live_probe, dict) else {}
+    model_metadata = live_probe.get("model_metadata")
+    model_metadata = model_metadata if isinstance(model_metadata, dict) else {}
+    native_probe = live_probe.get("ollama_native_probe")
+    native_probe = native_probe if isinstance(native_probe, dict) else {}
+
+    if api_mode == "ollama_native_chat":
+        return native_probe.get("tool_calls_ok") is True
+
+    if capabilities.get("tool_calls_ok") is True:
+        return True
+    if live_probe.get("ok") is True and model_metadata.get("tools_capability") is not False:
+        return True
+    return False
+
+
+def _tool_required_fallback_skip_reason(
+    agent,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    fallback_entry: dict,
+) -> str | None:
+    if not getattr(agent, "_current_api_request_has_tools", False):
+        return None
+    if not base_url or not is_local_endpoint(base_url):
+        return None
+
+    api_mode = str(
+        fallback_entry.get("api_mode") or fallback_entry.get("adapter") or ""
+    ).strip()
+    snapshot, error = _load_fresh_tool_contract_snapshot()
+    if snapshot is None:
+        return f"no_tool_capable_fallback: {error}"
+    record = _find_tool_contract_record(
+        snapshot,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+    )
+    if record is None:
+        return (
+            "no_tool_capable_fallback: local/private fallback lacks "
+            "provider_tool_contracts_snapshot proof"
+        )
+    if _tool_contract_record_supports_tools(record, api_mode=api_mode):
+        return None
+
+    live_probe = record.get("live_probe") if isinstance(record, dict) else {}
+    live_probe = live_probe if isinstance(live_probe, dict) else {}
+    err = str(live_probe.get("error") or "tool-call contract not proven").strip()
+    if len(err) > 180:
+        err = err[:177].rstrip() + "..."
+    return f"no_tool_capable_fallback: {err}"
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -1293,6 +1423,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_provider)
             unavailable.add(fb_key)
             return agent._try_activate_fallback(reason)  # try next in chain
+        _fb_resolved_base_url = str(getattr(fb_client, "base_url", "") or "")
+        _tool_skip_reason = _tool_required_fallback_skip_reason(
+            agent,
+            provider=fb_provider,
+            model=fb_model,
+            base_url=_fb_resolved_base_url,
+            fallback_entry=fb,
+        )
+        if _tool_skip_reason:
+            agent._last_fallback_skip_reason = _tool_skip_reason
+            logger.warning(
+                "Fallback skip: %s/%s at %s skipped for tool-required request: %s",
+                fb_provider,
+                fb_model,
+                _fb_resolved_base_url,
+                _tool_skip_reason,
+            )
+            try:
+                agent._buffer_status(
+                    f"⏭️ Skipping fallback {fb_model} via {fb_provider}: "
+                    f"{_tool_skip_reason}"
+                )
+            except Exception:
+                pass
+            return agent._try_activate_fallback(reason=reason)
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 

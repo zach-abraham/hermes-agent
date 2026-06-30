@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -164,6 +165,53 @@ def _looks_like_credential(name: str) -> bool:
     if name in _CREDENTIAL_NAMES:
         return True
     return any(name.endswith(suf) for suf in _CREDENTIAL_SUFFIXES)
+
+
+_HERMES_LOG_FILENAMES = frozenset({"agent.log", "errors.log", "gateway.log", "gui.log"})
+
+
+def _drop_non_test_hermes_file_handlers(fake_hermes_home: Path) -> None:
+    """Close Hermes file handlers that still point outside this test home."""
+    fake_home = fake_hermes_home.resolve()
+    removed = False
+    seen_handlers: set[int] = set()
+
+    loggers = [logging.getLogger()]
+    loggers.extend(
+        logger
+        for logger in logging.Logger.manager.loggerDict.values()
+        if isinstance(logger, logging.Logger)
+    )
+
+    for logger in loggers:
+        for handler in list(logger.handlers):
+            base_filename = getattr(handler, "baseFilename", None)
+            if not base_filename:
+                continue
+            try:
+                log_path = Path(base_filename).resolve()
+            except OSError:
+                continue
+            if log_path.name not in _HERMES_LOG_FILENAMES:
+                continue
+            try:
+                log_path.relative_to(fake_home)
+                continue
+            except ValueError:
+                pass
+            logger.removeHandler(handler)
+            if id(handler) not in seen_handlers:
+                handler.close()
+                seen_handlers.add(id(handler))
+            removed = True
+
+    if removed:
+        try:
+            import hermes_logging as _hermes_logging
+
+            _hermes_logging._logging_initialized = False
+        except Exception:
+            pass
 
 
 # HERMES_* vars that change test behavior by being set. Unset all of these
@@ -359,6 +407,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    if "run_agent" in sys.modules:
+        monkeypatch.setattr(
+            sys.modules["run_agent"], "_hermes_home", fake_hermes_home, raising=False
+        )
+    _drop_non_test_hermes_file_handlers(fake_hermes_home)
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
