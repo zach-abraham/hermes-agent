@@ -493,12 +493,10 @@ def _cron_provider_gate_script() -> Optional[Path]:
     if raw:
         candidates.append(Path(raw).expanduser())
     else:
-        candidates.extend(
-            [
-                _get_hermes_home() / "scripts" / "cron_provider_gate.py",
-                Path.home() / ".hermes" / "scripts" / "cron_provider_gate.py",
-            ]
-        )
+        hermes_home = _get_hermes_home()
+        candidates.append(hermes_home / "scripts" / "cron_provider_gate.py")
+        if hermes_home == Path.home() / ".hermes":
+            candidates.append(Path.home() / ".hermes" / "scripts" / "cron_provider_gate.py")
     for path in candidates:
         try:
             if path.exists() and path.is_file():
@@ -2812,12 +2810,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         fallback_model = get_fallback_chain(_cfg) or None
+        _cfg_model_for_gate = _cfg.get("model") if isinstance(_cfg.get("model"), dict) else {}
+        _gate_provider = runtime_requested_provider
+        _gate_base_url = runtime_explicit_base_url
+        if not _gate_provider and isinstance(_cfg_model_for_gate, dict):
+            _gate_provider = _cfg_model_for_gate.get("provider")
+            _gate_base_url = _gate_base_url or _cfg_model_for_gate.get("base_url")
         _gate_verdict = _run_cron_provider_gate(
             job,
             {
-                "provider": runtime_requested_provider,
+                "provider": _gate_provider,
                 "model": model,
-                "base_url": runtime_explicit_base_url,
+                "base_url": _gate_base_url,
                 "fallback_providers": fallback_model,
                 "provider_routing": pr,
             },
