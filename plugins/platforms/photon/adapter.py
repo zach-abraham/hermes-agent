@@ -84,6 +84,7 @@ _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
+_PHOTON_RECOVERY_STATE_PATH = Path.home() / ".hermes/state/photon_recovery.latest.json"
 
 # Photon / Envoy / spectrum-ts error substrings that indicate a transient
 # upstream overload rather than a permanent failure.  These are not in the
@@ -102,6 +103,7 @@ _PHOTON_RETRYABLE_PATTERNS = (
 # iMessage is a personal channel — suppressing rapid repeats reduces
 # upstream gRPC pressure during Photon overflow events.
 _TYPING_COOLDOWN_SECONDS = 5.0
+_STREAM_RESTART_COOLDOWN_SECONDS = 10 * 60
 
 # Group-chat mention wake words. When ``require_mention`` is enabled, group
 # messages are ignored unless they match one of these patterns — same
@@ -119,6 +121,13 @@ _DEFAULT_MENTION_PATTERNS = [
 def _coerce_port(value: Any, default: int) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -243,6 +252,15 @@ class PhotonAdapter(BasePlatformAdapter):
         self._inbound_running = False
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._sidecar_health_interval = 15.0
+        self._stream_restart_cooldown_seconds = _coerce_float(
+            extra.get("stream_restart_cooldown_seconds")
+            or os.getenv("PHOTON_STREAM_RESTART_COOLDOWN_SECONDS"),
+            _STREAM_RESTART_COOLDOWN_SECONDS,
+        )
+        self._stream_restart_cooldown_until = 0.0
+        self._stream_restart_count = 0
+        self._stream_failure_count = 0
+        self._stream_recovery_state = "closed"
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
         self._seen_messages: Dict[str, float] = {}
@@ -481,7 +499,10 @@ class PhotonAdapter(BasePlatformAdapter):
                 continue
 
             stream = data.get("stream") if isinstance(data, dict) else None
-            if not isinstance(stream, dict) or stream.get("ok") is not False:
+            if not isinstance(stream, dict):
+                continue
+            if stream.get("ok") is not False:
+                self._mark_stream_recovered()
                 continue
 
             state = str(stream.get("state") or "unknown")
@@ -506,6 +527,98 @@ class PhotonAdapter(BasePlatformAdapter):
                 logger.warning("[photon] fatal-error notification failed: %s", exc)
             break
 
+    def _classify_stream_issue(self, message: str) -> str:
+        text = message.lower()
+        if any(
+            needle in text
+            for needle in (
+                "rst_stream",
+                "live stream ended",
+                "incomplete chunked read",
+                "all connection attempts failed",
+                "peer closed connection",
+            )
+        ):
+            return "upstream_reset"
+        if "unavailable" in text or "connect error" in text:
+            return "upstream_unavailable"
+        return "degraded"
+
+    def _write_stream_recovery_state(
+        self,
+        *,
+        action: str,
+        failure_class: str,
+        message: str,
+        now: Optional[float] = None,
+    ) -> None:
+        now = time.time() if now is None else now
+        payload = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "state": self._stream_recovery_state,
+            "action": action,
+            "failure_class": failure_class,
+            "failure_count": self._stream_failure_count,
+            "restart_count": self._stream_restart_count,
+            "cooldown_until": self._stream_restart_cooldown_until,
+            "cooldown_remaining_s": max(
+                0.0, self._stream_restart_cooldown_until - now,
+            ),
+            "last_issue": message[:500],
+        }
+        try:
+            _PHOTON_RECOVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _PHOTON_RECOVERY_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n")
+            tmp.replace(_PHOTON_RECOVERY_STATE_PATH)
+        except Exception as exc:  # pragma: no cover - state writing is advisory
+            logger.debug("[photon] recovery state write failed: %s", exc)
+
+    def _mark_stream_recovered(self) -> None:
+        if self._stream_recovery_state == "closed" and self._stream_failure_count == 0:
+            return
+        self._stream_recovery_state = "closed"
+        self._stream_failure_count = 0
+        self._write_stream_recovery_state(
+            action="stream_recovered",
+            failure_class="none",
+            message="Photon upstream stream healthy",
+        )
+
+    def _stream_restart_allowed(self, message: str) -> bool:
+        now = time.time()
+        failure_class = self._classify_stream_issue(message)
+        self._stream_failure_count += 1
+        if now < self._stream_restart_cooldown_until:
+            self._stream_recovery_state = "open"
+            self._write_stream_recovery_state(
+                action="restart_suppressed",
+                failure_class=failure_class,
+                message=message,
+                now=now,
+            )
+            logger.warning(
+                "[photon] %s; suppressing sidecar restart for %.1fs "
+                "(failure_class=%s)",
+                message,
+                self._stream_restart_cooldown_until - now,
+                failure_class,
+            )
+            return False
+
+        self._stream_recovery_state = "half_open"
+        self._stream_restart_count += 1
+        self._stream_restart_cooldown_until = (
+            now + max(0.0, self._stream_restart_cooldown_seconds)
+        )
+        self._write_stream_recovery_state(
+            action="restart_allowed",
+            failure_class=failure_class,
+            message=message,
+            now=now,
+        )
+        return True
+
     async def _restart_sidecar_for_degraded_stream(self, message: str) -> bool:
         """Restart only the Photon sidecar after a degraded stream health check.
 
@@ -514,6 +627,8 @@ class PhotonAdapter(BasePlatformAdapter):
         to the same local port. If that narrow repair fails, the caller keeps the
         old retryable fatal path as a fallback.
         """
+        if not self._stream_restart_allowed(message):
+            return True
         logger.warning("[photon] %s; restarting sidecar in-place", message)
         try:
             await self._stop_sidecar()

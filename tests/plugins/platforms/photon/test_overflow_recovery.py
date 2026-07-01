@@ -232,11 +232,107 @@ async def test_degraded_stream_health_restarts_sidecar_in_place(
     monkeypatch.setattr(adapter, "_sidecar_call", _fake_call)
     monkeypatch.setattr(adapter, "_stop_sidecar", _fake_stop)
     monkeypatch.setattr(adapter, "_start_sidecar", _fake_start)
+    monkeypatch.setattr(
+        adapter,
+        "_write_stream_recovery_state",
+        lambda **_: None,
+    )
 
     await adapter._monitor_sidecar_health()
 
     assert adapter.has_fatal_error is False
     assert calls == ["stop", "start"]
+
+
+@pytest.mark.asyncio
+async def test_degraded_stream_restart_budget_suppresses_repeat_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    adapter._stream_restart_cooldown_seconds = 600.0
+
+    writes: list[Dict[str, Any]] = []
+
+    def _capture_state(
+        *,
+        action: str,
+        failure_class: str,
+        message: str,
+        now: float | None = None,
+    ) -> None:
+        writes.append(
+            {
+                "action": action,
+                "failure_class": failure_class,
+                "message": message,
+                "state": adapter._stream_recovery_state,
+            }
+        )
+
+    calls: list[str] = []
+
+    async def _fake_stop() -> None:
+        calls.append("stop")
+
+    async def _fake_start() -> None:
+        calls.append("start")
+
+    monkeypatch.setattr(adapter, "_write_stream_recovery_state", _capture_state)
+    monkeypatch.setattr(adapter, "_stop_sidecar", _fake_stop)
+    monkeypatch.setattr(adapter, "_start_sidecar", _fake_start)
+
+    message = (
+        "Photon upstream stream degraded: RetryableStreamError: Live stream ended"
+    )
+
+    assert await adapter._restart_sidecar_for_degraded_stream(message) is True
+    assert calls == ["stop", "start"]
+
+    assert await adapter._restart_sidecar_for_degraded_stream(message) is True
+    assert calls == ["stop", "start"]
+    assert writes[0]["action"] == "restart_allowed"
+    assert writes[0]["failure_class"] == "upstream_reset"
+    assert writes[1]["action"] == "restart_suppressed"
+    assert writes[1]["state"] == "open"
+
+
+def test_stream_recovered_resets_failure_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _make_adapter(monkeypatch)
+    adapter._stream_recovery_state = "open"
+    adapter._stream_failure_count = 3
+
+    writes: list[Dict[str, Any]] = []
+
+    def _capture_state(
+        *,
+        action: str,
+        failure_class: str,
+        message: str,
+        now: float | None = None,
+    ) -> None:
+        writes.append(
+            {
+                "action": action,
+                "failure_class": failure_class,
+                "message": message,
+                "state": adapter._stream_recovery_state,
+            }
+        )
+
+    monkeypatch.setattr(adapter, "_write_stream_recovery_state", _capture_state)
+
+    adapter._mark_stream_recovered()
+
+    assert adapter._stream_recovery_state == "closed"
+    assert adapter._stream_failure_count == 0
+    assert writes == [
+        {
+            "action": "stream_recovered",
+            "failure_class": "none",
+            "message": "Photon upstream stream healthy",
+            "state": "closed",
+        }
+    ]
 
 
 @pytest.mark.asyncio
