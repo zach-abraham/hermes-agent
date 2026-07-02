@@ -7,6 +7,7 @@ rather than silently leaving polling dead.
 """
 
 import asyncio
+import json
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,15 +38,56 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _no_auto_discovery(monkeypatch):
+def _no_auto_discovery(monkeypatch, tmp_path):
     """Disable DoH auto-discovery so connect() uses the plain builder chain."""
     async def _noop():
         return []
     monkeypatch.setattr("plugins.platforms.telegram.adapter.discover_fallback_ips", _noop)
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter._TELEGRAM_RECOVERY_STATE_PATH",
+        tmp_path / "telegram_recovery.latest.json",
+    )
 
 
 def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+
+def test_telegram_recovery_state_writer_records_required_fields(monkeypatch, tmp_path):
+    """Recovery telemetry must be compact and machine-checkable."""
+    state_path = tmp_path / "telegram_recovery.latest.json"
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter._TELEGRAM_RECOVERY_STATE_PATH",
+        state_path,
+    )
+    adapter = _make_adapter()
+    adapter._telegram_fallback_ips_count = 2
+    adapter._send_path_degraded = True
+    adapter._polling_network_error_count = 3
+
+    adapter._write_telegram_recovery_state(
+        state="retrying",
+        phase="polling_reconnect",
+        attempt=3,
+        max_attempts=10,
+        failure_class="network_error",
+        next_retry_s=20,
+        error=TimeoutError("timed out"),
+    )
+
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["state"] == "retrying"
+    assert data["phase"] == "polling_reconnect"
+    assert data["attempt"] == 3
+    assert data["max_attempts"] == 10
+    assert data["failure_class"] == "network_error"
+    assert data["fallback_ips_count"] == 2
+    assert data["sticky_ip_active"] is False
+    assert data["next_retry_s"] == 20
+    assert data["last_error_kind"] == "timeout"
+    assert data["send_path_degraded"] is True
+    assert data["polling_network_error_count"] == 3
+    assert data["updated_at"].endswith("Z")
 
 
 @pytest.mark.asyncio
@@ -188,6 +230,45 @@ async def test_reconnect_success_resets_error_count():
 
 
 @pytest.mark.asyncio
+async def test_reconnect_success_writes_recovered_state(monkeypatch, tmp_path):
+    """A successful polling reconnect should close the recovery state."""
+    state_path = tmp_path / "telegram_recovery.latest.json"
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter._TELEGRAM_RECOVERY_STATE_PATH",
+        state_path,
+    )
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 2
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot.get_me = AsyncMock(return_value=MagicMock())
+    adapter._app = mock_app
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Bad Gateway"))
+
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["state"] == "recovered"
+    assert data["phase"] == "polling_reconnect"
+    assert data["failure_class"] == "none"
+    assert data["polling_network_error_count"] == 0
+
+    pending = [t for t in adapter._background_tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_reconnect_triggers_fatal_after_max_retries():
     """
     After MAX_NETWORK_RETRIES attempts, the adapter should set a fatal error
@@ -207,6 +288,29 @@ async def test_reconnect_triggers_fatal_after_max_retries():
     assert adapter.has_fatal_error
     assert adapter.fatal_error_code == "telegram_network_error"
     fatal_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_fatal_writes_retry_budget_state(monkeypatch, tmp_path):
+    """Exhausted polling reconnects should be visible before supervisor restart."""
+    state_path = tmp_path / "telegram_recovery.latest.json"
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter._TELEGRAM_RECOVERY_STATE_PATH",
+        state_path,
+    )
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 10
+    adapter.set_fatal_error_handler(AsyncMock())
+
+    await adapter._handle_polling_network_error(TimeoutError("still failing"))
+
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["state"] == "fatal"
+    assert data["phase"] == "polling_reconnect"
+    assert data["failure_class"] == "retry_budget_exhausted"
+    assert data["attempt"] == 11
+    assert data["max_attempts"] == 10
+    assert data["last_error_kind"] == "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -811,4 +915,3 @@ async def test_schedule_polling_recovery_tracks_background_task():
     assert adapter._polling_error_task in adapter._background_tasks
     await adapter._polling_error_task
     adapter._handle_polling_network_error.assert_awaited_once()
-

@@ -108,6 +108,7 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+_TELEGRAM_RECOVERY_STATE_PATH = _Path.home() / ".hermes/state/telegram_recovery.latest.json"
 
 
 def check_telegram_requirements() -> bool:
@@ -1009,6 +1010,68 @@ class TelegramAdapter(BasePlatformAdapter):
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
 
     @staticmethod
+    def _telegram_error_kind(error: Optional[Exception]) -> str:
+        if error is None:
+            return "none"
+        name = error.__class__.__name__.lower()
+        text = str(error).lower()
+        if "conflict" in name or "terminated by other getupdates request" in text:
+            return "polling_conflict"
+        if "timeout" in name or "timed out" in text or "timeout" in text:
+            return "timeout"
+        if "network" in name:
+            return "network_error"
+        if "connection" in name or "connect" in text:
+            return "connect_error"
+        return name or "error"
+
+    def _write_telegram_recovery_state(
+        self,
+        *,
+        state: str,
+        phase: str,
+        attempt: int = 0,
+        max_attempts: int = 0,
+        failure_class: str = "none",
+        fallback_ips_count: Optional[int] = None,
+        sticky_ip_active: bool = False,
+        next_retry_s: Optional[float] = None,
+        error: Optional[Exception] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Best-effort compact recovery state for watchdog/cycle selection."""
+        now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = {
+            "ts": now,
+            "updated_at": now,
+            "state": state,
+            "phase": phase,
+            "attempt": int(attempt or 0),
+            "max_attempts": int(max_attempts or 0),
+            "failure_class": failure_class,
+            "fallback_ips_count": int(
+                fallback_ips_count
+                if fallback_ips_count is not None
+                else getattr(self, "_telegram_fallback_ips_count", 0)
+            ),
+            "sticky_ip_active": bool(sticky_ip_active),
+            "next_retry_s": next_retry_s,
+            "last_error_kind": self._telegram_error_kind(error),
+            "last_error": (str(error)[:500] if error is not None else None),
+            "message": (message[:500] if message else None),
+            "send_path_degraded": bool(getattr(self, "_send_path_degraded", False)),
+            "polling_network_error_count": int(getattr(self, "_polling_network_error_count", 0)),
+            "fatal": bool(getattr(self, "has_fatal_error", False)),
+        }
+        try:
+            _TELEGRAM_RECOVERY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _TELEGRAM_RECOVERY_STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(_TELEGRAM_RECOVERY_STATE_PATH)
+        except Exception as exc:  # pragma: no cover - telemetry must not affect delivery
+            logger.debug("[%s] Telegram recovery state write failed: %s", self.name, exc)
+
+    @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
         text = str(error).lower()
         return (
@@ -1755,6 +1818,16 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         self._send_path_degraded = True
+        self._write_telegram_recovery_state(
+            state="retrying",
+            phase=reason.replace(" ", "_"),
+            attempt=max(1, int(getattr(self, "_polling_network_error_count", 0) or 0)),
+            max_attempts=10,
+            failure_class="network_error",
+            next_retry_s=5,
+            error=error,
+            message=f"polling recovery scheduled: {reason}",
+        )
         logger.warning(
             "[%s] Telegram polling degraded (%s); gateway stays alive and will retry. Error: %s",
             self.name, reason, error,
@@ -1805,6 +1878,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 drop_pending_updates=drop_pending_updates,
                 error_callback=error_callback,
             )
+            self._write_telegram_recovery_state(
+                state="recovered",
+                phase="polling_bootstrap",
+                failure_class="none",
+                message="Telegram polling started",
+            )
             return True
         except Exception as err:
             if self._looks_like_polling_conflict(err):
@@ -1812,6 +1891,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Telegram polling bootstrap conflict; gateway stays alive "
                     "while conflict retry runs: %s",
                     self.name, err,
+                )
+                self._write_telegram_recovery_state(
+                    state="retrying",
+                    phase="polling_bootstrap",
+                    attempt=1,
+                    max_attempts=10,
+                    failure_class="polling_conflict",
+                    next_retry_s=5,
+                    error=err,
                 )
                 loop = asyncio.get_running_loop()
                 self._polling_error_task = loop.create_task(self._handle_polling_conflict(err))
@@ -1852,11 +1940,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 "Restarting gateway." % MAX_NETWORK_RETRIES
             )
             logger.error("[%s] %s Last error: %s", self.name, message, error)
+            self._write_telegram_recovery_state(
+                state="fatal",
+                phase="polling_reconnect",
+                attempt=attempt,
+                max_attempts=MAX_NETWORK_RETRIES,
+                failure_class="retry_budget_exhausted",
+                error=error,
+                message=message,
+            )
             self._set_fatal_error("telegram_network_error", message, retryable=True)
             await self._notify_fatal_error()
             return
 
         delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
+        self._write_telegram_recovery_state(
+            state="retrying",
+            phase="polling_reconnect",
+            attempt=attempt,
+            max_attempts=MAX_NETWORK_RETRIES,
+            failure_class="network_error",
+            next_retry_s=delay,
+            error=error,
+        )
         logger.warning(
             "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s",
             self.name, attempt, MAX_NETWORK_RETRIES, delay, error,
@@ -1901,6 +2007,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # (or forever, if the probe is never scheduled), blocking the send
             # path even though the bot has fully recovered. See #35205.
             self._send_path_degraded = False
+            self._write_telegram_recovery_state(
+                state="recovered",
+                phase="polling_reconnect",
+                attempt=attempt,
+                max_attempts=MAX_NETWORK_RETRIES,
+                failure_class="none",
+                message="Telegram polling resumed after network error",
+            )
             # start_polling() returning is necessary but not sufficient:
             # PTB's Updater can be left in a state where `running` is True
             # but the underlying long-poll task is wedged on a stale httpx
@@ -1914,6 +2028,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 probe.add_done_callback(self._background_tasks.discard)
         except Exception as retry_err:
             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, retry_err)
+            self._write_telegram_recovery_state(
+                state="retrying",
+                phase="polling_reconnect_failed",
+                attempt=attempt,
+                max_attempts=MAX_NETWORK_RETRIES,
+                failure_class="network_error",
+                next_retry_s=min(BASE_DELAY * (2 ** attempt), MAX_DELAY),
+                error=retry_err,
+            )
             # start_polling failed — polling is dead and no further error
             # callbacks will fire, so schedule the next retry ourselves.
             if not self.has_fatal_error:
@@ -2136,6 +2259,12 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
+            self._write_telegram_recovery_state(
+                state="recovered",
+                phase="polling_probe",
+                failure_class="none",
+                message="Telegram polling heartbeat probe succeeded after reconnect",
+            )
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -2847,6 +2976,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     ", ".join(fallback_ips),
                 )
+            self._telegram_fallback_ips_count = len(fallback_ips)
+            self._write_telegram_recovery_state(
+                state="observed",
+                phase="fallback_discovery",
+                failure_class="fallback_ips_ready" if fallback_ips else "no_fallback_ips",
+                fallback_ips_count=len(fallback_ips),
+                message="Telegram fallback IP discovery completed",
+            )
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
             proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
@@ -2925,17 +3062,53 @@ class TelegramAdapter(BasePlatformAdapter):
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
+                    self._write_telegram_recovery_state(
+                        state="connecting",
+                        phase="bootstrap_initialize",
+                        attempt=_attempt + 1,
+                        max_attempts=_max_connect,
+                        failure_class="none",
+                        fallback_ips_count=len(fallback_ips),
+                    )
                     await asyncio.wait_for(self._app.initialize(), timeout=_init_timeout)
+                    self._write_telegram_recovery_state(
+                        state="recovered",
+                        phase="bootstrap_initialize",
+                        attempt=_attempt + 1,
+                        max_attempts=_max_connect,
+                        failure_class="none",
+                        fallback_ips_count=len(fallback_ips),
+                        message="Telegram application initialized",
+                    )
                     break
                 except asyncio.TimeoutError:
                     if _attempt < _max_connect - 1:
                         wait = min(2 ** _attempt, 15)
+                        self._write_telegram_recovery_state(
+                            state="retrying",
+                            phase="bootstrap_initialize",
+                            attempt=_attempt + 1,
+                            max_attempts=_max_connect,
+                            failure_class="connect_timeout",
+                            fallback_ips_count=len(fallback_ips),
+                            next_retry_s=wait,
+                            error=TimeoutError("Telegram initialization timed out"),
+                        )
                         logger.warning(
                             "[%s] Connect attempt %d/%d timed out after %.0fs — retrying in %ds",
                             self.name, _attempt + 1, _max_connect, _init_timeout, wait,
                         )
                         await asyncio.sleep(wait)
                     else:
+                        self._write_telegram_recovery_state(
+                            state="fatal",
+                            phase="bootstrap_initialize",
+                            attempt=_attempt + 1,
+                            max_attempts=_max_connect,
+                            failure_class="connect_timeout",
+                            fallback_ips_count=len(fallback_ips),
+                            error=TimeoutError("Telegram initialization timed out"),
+                        )
                         raise OSError(
                             f"Telegram initialization timed out after {_max_connect} attempts "
                             f"({_init_timeout:.0f}s each). Check network connectivity to api.telegram.org "
@@ -2944,12 +3117,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 except (NetworkError, TimedOut, OSError) as init_err:
                     if _attempt < _max_connect - 1:
                         wait = min(2 ** _attempt, 15)
+                        self._write_telegram_recovery_state(
+                            state="retrying",
+                            phase="bootstrap_initialize",
+                            attempt=_attempt + 1,
+                            max_attempts=_max_connect,
+                            failure_class="network_error",
+                            fallback_ips_count=len(fallback_ips),
+                            next_retry_s=wait,
+                            error=init_err,
+                        )
                         logger.warning(
                             "[%s] Connect attempt %d/%d failed: %s — retrying in %ds",
                             self.name, _attempt + 1, _max_connect, init_err, wait,
                         )
                         await asyncio.sleep(wait)
                     else:
+                        self._write_telegram_recovery_state(
+                            state="fatal",
+                            phase="bootstrap_initialize",
+                            attempt=_attempt + 1,
+                            max_attempts=_max_connect,
+                            failure_class="network_error",
+                            fallback_ips_count=len(fallback_ips),
+                            error=init_err,
+                        )
                         raise
             await self._app.start()
 
