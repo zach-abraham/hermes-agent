@@ -2358,15 +2358,19 @@ class PhotonAdapter(BasePlatformAdapter):
     def _is_permanent_sidecar_failure(result: SendResult) -> bool:
         """True when the sidecar classified the failure as permanent.
 
-        ``auth_or_config`` and ``target_not_allowed`` cannot be fixed by
-        retrying or by the plain-text fallback resend — attempting either
-        just double-sends a doomed request (issue #50971).
+        ``auth_or_config``, ``target_not_allowed``, and provider-side rate
+        limits cannot be fixed by retrying or by the plain-text fallback
+        resend — attempting either just repeats a doomed request.
         """
         raw = result.raw_response
         return (
             isinstance(raw, dict)
             and raw.get("retryable") is False
-            and raw.get("error_class") in ("auth_or_config", "target_not_allowed")
+            and raw.get("error_class") in (
+                "auth_or_config",
+                "target_not_allowed",
+                "provider_rate_limited",
+            )
         )
 
     async def _send_with_retry(

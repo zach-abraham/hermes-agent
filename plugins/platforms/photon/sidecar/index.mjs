@@ -819,6 +819,22 @@ function classifySidecarError(err) {
     return { errorClass: "target_not_allowed", retryable: false };
   }
 
+  // Photon applies a provider-side cooling gate when the recipient has not
+  // replied.  This is a permanent failure for the current delivery attempt,
+  // not a sidecar crash or a transient network outage. Preserve a safe class
+  // so Hermes can fall back immediately without retrying the same doomed send.
+  if (
+    lowered.includes("ratelimiterror") ||
+    lowered.includes("rate limit") ||
+    lowered.includes("rate_limited") ||
+    lowered.includes("recipient has not replied") ||
+    lowered.includes("cooling") ||
+    lowered.includes("limits sends") ||
+    lowered.includes("429")
+  ) {
+    return { errorClass: "provider_rate_limited", retryable: false };
+  }
+
   if (
     lowered.includes("unauthorized") ||
     lowered.includes("forbidden") ||
