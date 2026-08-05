@@ -6308,6 +6308,80 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
 
+
+    async def _handle_hal_product_callback(self, query, data: str) -> None:
+        """Approve/kill/later TikTok product labs from inline buttons (hl:a|k|l:id)."""
+        parts = (data or "").split(":", 2)
+        if len(parts) != 3 or parts[0] != "hl" or parts[1] not in ("a", "k", "l"):
+            await query.answer(text="Invalid product button.")
+            return
+        choice, did = parts[1], parts[2]
+        caller_id = str(getattr(query.from_user, "id", "") or "")
+        if caller_id not in {"1704842707"}:
+            try:
+                ok_auth = self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=getattr(getattr(query, "message", None), "chat_id", None),
+                    chat_type=str(
+                        getattr(
+                            getattr(getattr(query, "message", None), "chat", None),
+                            "type",
+                            "",
+                        )
+                        or ""
+                    ),
+                    thread_id=None,
+                    user_name=getattr(query.from_user, "first_name", None),
+                )
+            except Exception:
+                ok_auth = False
+            if not ok_auth:
+                await query.answer(text="Not authorized.")
+                return
+        flag = {
+            "a": "--product-approve",
+            "k": "--product-kill",
+            "l": "--product-later",
+        }[choice]
+        import asyncio
+        from pathlib import Path as _Path
+        script = _Path.home() / "clawd" / "hal-selfimprove" / "tools" / "escalation_phone.py"
+        if not script.is_file():
+            await query.answer(text="Resolver missing.")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/opt/homebrew/bin/python3",
+                str(script),
+                flag,
+                did,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=45)
+            out = (out_b or b"").decode("utf-8", "ignore")
+            import json as _json
+            try:
+                payload = _json.loads(out)
+            except Exception:
+                payload = {"ok": False, "error": out[:200] or (err_b or b"").decode()[:200]}
+        except Exception as exc:
+            await query.answer(text=("Resolver error: %s" % exc)[:180])
+            return
+        if payload.get("ok"):
+            verb = {"a": "Building", "k": "Killed", "l": "Later"}[choice]
+            title = str(payload.get("title") or "")[:100]
+            await query.answer(text=verb)
+            user_display = getattr(query.from_user, "first_name", "Zach")
+            edit = f"{verb} · {user_display}\n{title}"
+            try:
+                await query.edit_message_text(text=edit, reply_markup=None)
+            except Exception:
+                pass
+        else:
+            err = str(payload.get("error") or "failed")[:120]
+            await query.answer(text=err)
+
     async def _handle_needs_zach_callback(self, query, data: str) -> None:
         """Approve/deny HAL needs-zach decisions from phone inline buttons.
 
@@ -6408,6 +6482,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Needs-Zach decision approvals (nz:a:id / nz:d:id) ---
         if isinstance(data, str) and data.startswith("nz:"):
             await self._handle_needs_zach_callback(query, data)
+            return
+        # --- HAL product lab decisions (hl:a|k|l:id) ---
+        if isinstance(data, str) and data.startswith("hl:"):
+            await self._handle_hal_product_callback(query, data)
             return
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
