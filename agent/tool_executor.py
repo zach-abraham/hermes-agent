@@ -49,6 +49,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.message_sanitization import UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,18 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     except (json.JSONDecodeError, TypeError):
         arguments = None
     if isinstance(arguments, dict):
+        if arguments.get(UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY) is True:
+            return {}, json.dumps(
+                {
+                    "error": "Invalid tool arguments",
+                    "message": (
+                        "Tool arguments were malformed and could not be "
+                        "repaired; tool was not executed. Retry with a valid "
+                        "JSON object containing the required parameters."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         return arguments, None
     return {}, json.dumps(
         {

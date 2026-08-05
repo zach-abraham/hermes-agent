@@ -22,6 +22,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY = "__hal_unrepairable_tool_call_arguments__"
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard
@@ -189,8 +191,9 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     Models like GLM-5.1 via Ollama can produce truncated JSON, trailing
     commas, Python ``None``, etc.  The API proxy rejects these with HTTP 400
     "invalid tool call arguments".  This function applies common repairs;
-    if all fail it returns ``"{}"`` so the request succeeds (better than
-    crashing the session).  All repairs are logged at WARNING level.
+    if all fail it returns an executor-blocked sentinel so the request can
+    continue without silently executing a tool with an empty argument object.
+    All repairs are logged at WARNING level.
     """
     raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
 
@@ -270,14 +273,17 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    # Last resort: replace with empty object so the API request doesn't
-    # crash the entire session.
+    # Last resort: keep the API request valid, but mark the call as blocked so
+    # the executor returns a recovery hint instead of running with {}.
     logger.warning(
         "Unrepairable tool_call arguments for %s — "
-        "replaced with empty object (was: %s)",
+        "replaced with executor-blocked sentinel (was: %s)",
         tool_name, raw_stripped[:80],
     )
-    return "{}"
+    return json.dumps({
+        UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY: True,
+        "tool_name": tool_name,
+    }, separators=(",", ":"))
 
 
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
@@ -469,6 +475,7 @@ __all__ = [
     "_sanitize_structure_surrogates",
     "_sanitize_messages_surrogates",
     "_escape_invalid_chars_in_json_strings",
+    "UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY",
     "_repair_tool_call_arguments",
     "_strip_non_ascii",
     "_sanitize_messages_non_ascii",

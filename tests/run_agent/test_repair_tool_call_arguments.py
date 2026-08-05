@@ -3,6 +3,8 @@
 import json
 
 from run_agent import _repair_tool_call_arguments
+from agent.message_sanitization import UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY
+from agent.tool_executor import _parse_tool_arguments
 
 
 class TestRepairToolCallArguments:
@@ -39,9 +41,23 @@ class TestRepairToolCallArguments:
     # -- Stage 6: last resort --
 
 
-    def test_unrepairable_partial_returns_empty_object(self):
+    def test_unrepairable_partial_returns_executor_blocked_sentinel(self):
         # Truncated in the middle of a string key — bracket closing won't help
-        assert _repair_tool_call_arguments('{"truncated": "val', "t") == "{}"
+        result = _repair_tool_call_arguments('{"truncated": "val', "t")
+        parsed = json.loads(result)
+        assert parsed == {
+            UNREPAIRABLE_TOOL_CALL_ARGUMENTS_SENTINEL_KEY: True,
+            "tool_name": "t",
+        }
+
+    def test_executor_blocks_unrepairable_sentinel(self):
+        result = _repair_tool_call_arguments('{"truncated": "val', "t")
+        args, tool_result = _parse_tool_arguments(result)
+        assert args == {}
+        assert tool_result is not None
+        parsed = json.loads(tool_result)
+        assert parsed["error"] == "Invalid tool arguments"
+        assert "could not be repaired" in parsed["message"]
 
     # -- Valid JSON passthrough (this path is via except, but still works) --
 
@@ -59,5 +75,4 @@ class TestRepairToolCallArguments:
 
 
     # -- Stage 4: control-char escape fallback --
-
 
