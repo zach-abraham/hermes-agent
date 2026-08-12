@@ -695,6 +695,26 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_contaminated_referenced_path_does_not_crash_guard(self, tmp_path):
+        """A decoded referenced script can contain a NUL in a path-like token.
+
+        The terminal guard must not let that token crash os.open() during the
+        recursive referenced-script scan; it should skip the unreadable path and
+        keep evaluating the rest of the command safely.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "nul-token.sh"
+        script.write_text("#!/bin/bash\n/tmp/not-a-real-script-\x00.sh\n")
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(script),
+            cwd=str(tmp_path),
+        )
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
